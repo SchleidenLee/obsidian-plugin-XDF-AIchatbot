@@ -1,0 +1,66 @@
+{
+  "name": "xdf-aichatbot",
+  "version": "0.1.0",
+  "description": "XDF teaching-archive agent shell forked from LLM Hub",
+  "main": "main.js",
+  "scripts": {
+    "generate:builtin-okf": "node scripts/generate-builtin-okf.mjs",
+    "dev": "npm run generate:builtin-okf && node esbuild.config.mjs",
+    "dev:langfuse": "npm run generate:builtin-okf && node esbuild.config.mjs langfuse",
+    "build": "npm run generate:builtin-okf && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "build:langfuse": "npm run generate:builtin-okf && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production langfuse",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "preversion": "npm run lint && npm run build",
+    "version": "node version-bump.mjs && git add manifest.json versions.json"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "gemini",
+    "ai",
+    "rag"
+  ],
+  "author": "takeshy",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/takeshy/obsidian-llm-hub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/takeshy/obsidian-llm-hub/issues"
+  },
+  "devDependencies": {
+    "@codemirror/state": "6.5.0",
+    "@codemirror/view": "6.38.6",
+    "@eslint/json": "^0.14.0",
+    "@types/diff": "^7.0.2",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "esbuild": "^0.28.1",
+    "eslint-plugin-obsidianmd": "^0.4.1",
+    "langfuse": "^3.38.6",
+    "obsidian": "^1.13.1",
+    "tslib": "^2.4.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.49.0",
+    "vitest": "^4.0.18"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
+    "@google/genai": "^2.13.0",
+    "diff": "^8.0.2",
+    "fflate": "^0.8.3",
+    "lucide-react": "^0.503.0",
+    "openai": "^6.32.0",
+    "pdf-lib": "^1.17.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.0.0",
+    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "^0.10.0"
+  }
+}

@@ -1,0 +1,1525 @@
+import { Plugin, WorkspaceLeaf, Notice, MarkdownView, TFile, Modal, type EventRef } from "obsidian";
+import { syncToolkitsMcp } from "src/xdf/bindToolkits";
+import { EventEmitter } from "src/utils/EventEmitter";
+import type { SelectionLocationInfo } from "src/ui/selectionHighlight";
+import { SelectionManager } from "src/plugin/selectionManager";
+import { EncryptionManager } from "src/plugin/encryptionManager";
+import { WorkflowManager } from "src/plugin/workflowManager";
+import { WorkspaceStateManager } from "src/core/workspaceStateManager";
+import { ChatView, VIEW_TYPE_GEMINI_CHAT } from "src/ui/ChatView";
+import { CryptView, CRYPT_VIEW_TYPE } from "src/ui/CryptView";
+import { CliTerminalView, CLI_TERMINAL_VIEW_TYPE } from "src/ui/CliTerminalView";
+import { SettingsTab } from "src/ui/SettingsTab";
+import {
+  type LlmHubSettings,
+  type WorkspaceState,
+  type RagSetting,
+  type ModelType,
+  type SlashCommand,
+  type LocalLlmConfig,
+  type CliProviderConfig,
+  DEFAULT_SETTINGS,
+  DEFAULT_LOCAL_LLM_CONFIG,
+  getGeminiApiKey,
+  normalizeDeprecatedGeminiModelName,
+  normalizeDeprecatedModelIdentifier,
+} from "src/types";
+import { initGeminiClient, resetGeminiClient, getGeminiClient } from "src/core/gemini";
+import { initLangfuse, resetLangfuse } from "src/tracing/langfuse";
+import { WorkflowSelectorModal } from "src/ui/components/workflow/WorkflowSelectorModal";
+import {
+  initLocalRagStore,
+  resetLocalRagStore,
+  getLocalRagStore,
+  isGeminiMultimodalEmbeddingModel,
+} from "src/core/localRagStore";
+import { initCliProviderManager } from "src/core/cliProvider";
+import {
+  initEditHistoryManager,
+  resetEditHistoryManager,
+  getEditHistoryManager,
+} from "src/core/editHistory";
+import { EditHistoryModal } from "src/ui/components/EditHistoryModal";
+import { formatError } from "src/utils/error";
+import { DEFAULT_CLI_CONFIG, DEFAULT_DISCORD_SETTINGS, DEFAULT_EDIT_HISTORY_SETTINGS, DEFAULT_GEMINI_EMBEDDING_MODEL, DEFAULT_LANGFUSE_SETTINGS, DEFAULT_WORKSPACE_FOLDER, hasVerifiedCli } from "src/types";
+import { initLocale, t } from "src/i18n";
+import { registerWorkflowCodeBlockProcessor } from "src/ui/workflowCodeBlock";
+import { initDiscordService, resetDiscordService } from "src/core/discordService";
+import { getSlashCommandSearchSelection } from "src/core/webSearch";
+import {
+  generateDashboardBase,
+  generateDashboardWorkflow,
+  listDashboardModels,
+  rewriteDashboardText,
+  runDashboardWorkflow,
+} from "src/integrations/dashboardHubCapabilities";
+import {
+  REGISTER_RUNTIME_SKILL_EVENT,
+  REQUEST_RUNTIME_SKILLS_EVENT,
+  UNREGISTER_RUNTIME_SKILL_EVENT,
+  registerRuntimeSkill,
+  unregisterRuntimeSkill,
+} from "src/core/runtimeSkills";
+import { registerDiscussionHubIntegration } from "src/integrations/discussionHubCapabilities";
+import {
+  applySettingsCredentials,
+  collectSettingsCredentials,
+  mergeConfiguredCredentials,
+  stripSettingsCredentials,
+  SETTINGS_CREDENTIAL_SECRET_ID,
+  type SettingsCredentialBundle,
+} from "src/core/credentialBundle";
+import { isSecretStorageAvailable, readSecretJson, writeSecretJson } from "src/core/secretStorage";
+
+interface DashboardHubIntegration {
+  protocolVersion: 1;
+  id: string;
+  name: string;
+  listModels: () => Promise<Array<{ id: string; name: string; capabilities: { text: boolean; vaultRead: boolean; tools: boolean } }>>;
+  getDefaultModel: () => Promise<string | null>;
+  openChatWithDraft: (draft: string) => void | Promise<void>;
+  askChatAboutSelection: (request: { text: string; sourcePath?: string }) => void | Promise<void>;
+  runWorkflow?: (request: { workflowPath: string; outputVariable?: string; abortSignal?: AbortSignal }) => Promise<string>;
+  generateBase?: (request: Parameters<typeof generateDashboardBase>[1]) => Promise<string>;
+  rewriteText?: (request: Parameters<typeof rewriteDashboardText>[1]) => Promise<string>;
+  generateWorkflow?: (request: Parameters<typeof generateDashboardWorkflow>[1]) => Promise<string>;
+}
+
+interface DashboardHubApi {
+  registerIntegration: (integration: DashboardHubIntegration) => () => void;
+  createDashboard: (requestedName?: string) => Promise<TFile | null>;
+}
+
+interface DashboardWorkspaceEvents {
+  on: (name: "dashboard-hub:ready", callback: (hub: DashboardHubApi) => void) => EventRef;
+  trigger: {
+    (name: "dashboard-hub:register-integration", integration: DashboardHubIntegration): void;
+    (name: "dashboard-hub:unregister-integration", request: { id: string; integration: DashboardHubIntegration }): void;
+  };
+}
+
+interface DiscussionHubApi {
+  openDiscussion: (request?: { theme?: string; attachments?: import("src/types").Attachment[] }) => Promise<void>;
+  getConfiguration: () => DiscussionHubConfiguration;
+  runDiscussion: (request: {
+    theme: string;
+    turns?: number;
+    participants?: DiscussionHubPerson[];
+    voters?: DiscussionHubPerson[];
+    abortSignal?: AbortSignal;
+  }) => Promise<DiscussionHubResult>;
+}
+
+export interface DiscussionHubPerson {
+  id: string;
+  providerId: string;
+  modelId: string;
+  displayName: string;
+  role?: string;
+}
+
+export interface DiscussionHubConfiguration {
+  defaultTurns: number;
+  participants: DiscussionHubPerson[];
+  voters: DiscussionHubPerson[];
+}
+
+export interface DiscussionHubResult {
+  theme: string;
+  turns: Array<{ turnNumber: number; responses: Array<{ displayName: string; content: string; error?: string }> }>;
+  conclusions: Array<{ displayName: string; content: string }>;
+  votes: Array<{ voterDisplayName: string; votedForDisplayName: string; reason?: string }>;
+  winnerId: string | null;
+  winnerIds: string[];
+  isDraw: boolean;
+  finalConclusion: string;
+  startTime: number;
+  participants: DiscussionHubPerson[];
+}
+
+function normaliseCliConfig(loaded: Record<string, unknown>): CliProviderConfig {
+  const raw = (loaded.cliConfig ?? {}) as Record<string, unknown>;
+  const migrated = raw.antigravityCliMigrated === true;
+  const config = {
+    ...DEFAULT_CLI_CONFIG,
+    ...raw,
+    antigravityCliMigrated: true,
+  };
+
+  if (!migrated) {
+    delete config.geminiCliPath;
+    if (raw.cliVerified === true) {
+      config.cliVerified = false;
+    }
+  }
+
+  return config;
+}
+
+/**
+ * Normalise the Local LLM config stored on disk into the modern array form.
+ * Handles three shapes:
+ *   1. New:   `localLlmConfigs: LocalLlmConfig[]` — used as-is (with id fill-in)
+ *   2. Mixed: array plus legacy fields — array wins, legacy ignored
+ *   3. Legacy: `localLlmConfig: {...}` + top-level verified/availableModels —
+ *      converted into a single entry in the array.
+ * Always returns an array (possibly empty).
+ */
+/**
+ * Seed `enabledModels` from the legacy `model` field when the stored config
+ * predates multi-model support, so existing saved selections keep working
+ * without the user having to re-pick anything.
+ */
+function fillEnabledModels(c: Partial<LocalLlmConfig>): string[] {
+  if (Array.isArray(c.enabledModels) && c.enabledModels.length > 0) {
+    return c.enabledModels;
+  }
+  return c.model ? [c.model] : [];
+}
+
+function normaliseLocalLlmConfigs(loaded: Record<string, unknown>): LocalLlmConfig[] {
+  const warnIfEmpty = (entry: LocalLlmConfig, source: string): void => {
+    if (entry.verified && entry.enabledModels?.length === 0) {
+      // Verified-but-modelless entries get filtered out of the chat dropdown
+      // (flatMap returns []), making them invisibly broken. Surface the
+      // condition so users / bug reports can correlate.
+      console.warn(
+        `[llm-hub] Local LLM "${entry.id}" (${source}) has no enabled models; ` +
+        `it will not appear in the chat dropdown until a model is selected.`,
+      );
+    }
+  };
+
+  const rawArray = loaded.localLlmConfigs;
+  if (Array.isArray(rawArray)) {
+    return rawArray.map((entry, i) => {
+      const e = entry as Partial<LocalLlmConfig>;
+      const normalised: LocalLlmConfig = {
+        ...DEFAULT_LOCAL_LLM_CONFIG,
+        ...e,
+        // Recovery path: a stored array entry without an id. Use a stable
+        // index-based id so the same load produces the same id on every
+        // restart — references saved against it stay valid.
+        id: e.id || `local_recovered_${i}`,
+        enabled: e.enabled !== false,
+        enabledModels: fillEnabledModels(e),
+      };
+      warnIfEmpty(normalised, "stored");
+      return normalised;
+    });
+  }
+
+  const legacy = loaded.localLlmConfig as Partial<LocalLlmConfig> | undefined;
+  if (legacy && typeof legacy === "object") {
+    const verified = Boolean(loaded.localLlmVerified);
+    const availableModels = Array.isArray(loaded.localLlmAvailableModels)
+      ? (loaded.localLlmAvailableModels as string[])
+      : [];
+    const migrated: LocalLlmConfig = {
+      ...DEFAULT_LOCAL_LLM_CONFIG,
+      ...legacy,
+      // Use a deterministic id so workspace state / discussion participants
+      // / Discord conversations that get saved against this migrated entry
+      // keep resolving across restarts. Without this, every loadSettings()
+      // would mint a new `Date.now()` id and orphan those saved references.
+      id: legacy.id || "local_legacy",
+      verified,
+      availableModels,
+      enabled: true,
+      enabledModels: fillEnabledModels(legacy),
+    };
+    warnIfEmpty(migrated, "legacy migration");
+    return [migrated];
+  }
+
+  return [];
+}
+
+function normalizeModelSetting<T>(model: T): T {
+  return typeof model === "string"
+    ? normalizeDeprecatedModelIdentifier(model) as T
+    : model;
+}
+
+function normalizeModelList(models: unknown): string[] {
+  if (!Array.isArray(models)) return [];
+  return Array.from(new Set(models
+    .filter((model): model is string => typeof model === "string")
+    .map(normalizeDeprecatedGeminiModelName)));
+}
+
+export class LlmHubPlugin extends Plugin {
+  settings: LlmHubSettings = { ...DEFAULT_SETTINGS };
+  settingsEmitter = new EventEmitter();
+  private wsManager!: WorkspaceStateManager;
+  private selectionManager!: SelectionManager;
+  private encryptionManager!: EncryptionManager;
+  private lastActiveMarkdownView: MarkdownView | null = null;
+  private workflowMgr!: WorkflowManager;
+  /** In-memory only – cleared on Obsidian restart */
+  lastActiveChatId: string | null = null;
+
+  // Delegate workspaceState to the manager
+  get workspaceState(): WorkspaceState {
+    return this.wsManager.workspaceState;
+  }
+  set workspaceState(value: WorkspaceState) {
+    this.wsManager.workspaceState = value;
+  }
+
+  onload(): void {
+    try {
+      this.onloadImpl();
+    } catch (e) {
+      // Mobile has no readable console: surface startup failures via a
+      // persistent Notice and a log file in the vault.
+      // JavaScriptCore's error.stack omits the message, so include both explicitly.
+      const msg = `XDF AI Chat: onload failed: ${String(e)}\n${e instanceof Error ? e.stack ?? "" : ""}`;
+      new Notice(msg, 0);
+      void this.app.vault.adapter.write("llm-hub-load-error.log", msg).catch(() => {});
+      throw e;
+    }
+  }
+
+  private onloadImpl(): void {
+    // Initialize i18n locale
+    initLocale();
+
+    // Initialize selection manager
+    this.selectionManager = new SelectionManager(this);
+
+    // Initialize encryption manager
+    this.encryptionManager = new EncryptionManager(this);
+
+    // Initialize workflow manager
+    this.workflowMgr = new WorkflowManager(this);
+
+    // Workflow code block: render as Mermaid diagram (Reading mode + Live Preview)
+    registerWorkflowCodeBlockProcessor(this);
+
+    // Initialize workspace state manager
+    this.wsManager = new WorkspaceStateManager(
+      this.app,
+      () => this.settings,
+      this.settingsEmitter,
+      () => this.loadData()
+    );
+
+    // Handle migration data modified event
+    this.settingsEmitter.on("migration-data-modified", (data: unknown) => {
+      void (async () => {
+        await this.saveData(data);
+      })();
+    });
+
+    // Load settings and workspace state
+    void this.loadSettings().then(async () => {
+      if (this.settings.xdfAutoBindToolkits !== false) {
+        try {
+          await syncToolkitsMcp(this);
+        } catch (e) {
+          console.error("XDF AI: failed to bind xdf-toolkits MCP:", e);
+        }
+        this.registerInterval(
+          window.setInterval(() => {
+            if (this.settings.xdfAutoBindToolkits === false) return;
+            void syncToolkitsMcp(this).catch(() => {});
+          }, 8000),
+        );
+      }
+      // Apply workspace folder visibility (body class toggle)
+      this.updateWorkspaceFolderVisibility();
+
+      // Migrate from old settings format first (one-time)
+      try {
+        await this.wsManager.migrateFromOldSettings();
+      } catch (e) {
+        console.error("LLM Hub: Failed to migrate old settings:", formatError(e));
+      }
+      try {
+        await this.wsManager.loadWorkspaceState();
+      } catch (e) {
+        console.error("LLM Hub: Failed to load workspace state:", formatError(e));
+      }
+      // Migrate slash commands (add default commands if missing)
+      try {
+        await this.migrateSlashCommands();
+      } catch (e) {
+        console.error("LLM Hub: Failed to migrate slash commands:", formatError(e));
+      }
+      // Initialize clients if any CLI is verified or any API provider is configured
+      try {
+        const cliConfig = this.settings.cliConfig || DEFAULT_CLI_CONFIG;
+        const anyLocalLlmVerified = this.settings.localLlmConfigs?.some(c => c.verified) ?? false;
+        if (hasVerifiedCli(cliConfig) || anyLocalLlmVerified || this.settings.apiProviders?.some(p => p.enabled && p.verified)) {
+          this.initializeClients();
+        }
+      } catch (e) {
+        console.error("LLM Hub: Failed to initialize clients:", formatError(e));
+      }
+      // Register workflows as Obsidian commands for hotkey support
+      try {
+        this.registerWorkflowHotkeys();
+      } catch (e) {
+        console.error("LLM Hub: Failed to register workflow hotkeys:", formatError(e));
+      }
+      // Register event listeners for workflow triggers
+      try {
+        this.registerWorkflowEventListeners();
+      } catch (e) {
+        console.error("LLM Hub: Failed to register workflow event listeners:", formatError(e));
+      }
+      this.app.workspace.onLayoutReady(() => {
+        void this.workflowMgr.triggerStartupWorkflows();
+      });
+      // Emit event to refresh UI after workspace state is loaded
+      this.settingsEmitter.emit("workspace-state-loaded", this.workspaceState);
+      // Notify UI components that settings are ready (fixes race condition where
+      // ChatView renders before loadSettings() completes, e.g. after BRAT hot-reload)
+      this.settingsEmitter.emit("settings-updated", this.settings);
+      this.notifyDashboardHubMigration();
+    }).catch((e) => {
+      console.error("LLM Hub: Failed to load settings:", formatError(e));
+    });
+
+    // Add settings tab
+    this.addSettingTab(new SettingsTab(this.app, this));
+    this.registerRuntimeSkillContributions();
+    this.registerDashboardHubIntegration();
+    registerDiscussionHubIntegration(this);
+    // Compatibility command: preserve existing hotkeys while Dashboard Hub
+    // remains the sole owner of .dashboard files and dashboard creation.
+    this.addCommand({
+      id: "create-dashboard",
+      name: t("command.createDashboard"),
+      callback: () => { void this.createDashboard(); },
+    });
+    this.addCommand({
+      id: "open-discussion-hub",
+      name: "Open Discussion Hub",
+      callback: () => { void this.openDiscussionHub(); },
+    });
+
+    // Register chat view
+    this.registerView(
+      VIEW_TYPE_GEMINI_CHAT,
+      (leaf) => new ChatView(leaf, this)
+    );
+
+    // Register crypt view (for encrypted files)
+    this.registerView(
+      CRYPT_VIEW_TYPE,
+      (leaf) => new CryptView(leaf, this)
+    );
+
+    // Register terminal view for full TTY CLI sessions
+    this.registerView(
+      CLI_TERMINAL_VIEW_TYPE,
+      (leaf) => new CliTerminalView(leaf, this)
+    );
+
+    // Register .encrypted extension so Obsidian opens these files in CryptView
+    // Wrapped in try-catch to avoid conflict when another plugin already registered this extension
+    try {
+      this.registerExtensions(["encrypted"], CRYPT_VIEW_TYPE);
+    } catch {
+      // Extension already registered by another plugin — skip
+    }
+
+    // Register file menu (right-click) for encryption and edit history
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        if (file instanceof TFile && file.extension === "md") {
+          menu.addItem((item) => {
+            item
+              .setTitle(t("crypt.encryptFile"))
+              .setIcon("lock")
+              .onClick(async () => {
+                await this.encryptFile(file);
+              });
+          });
+          menu.addItem((item) => {
+            item
+              .setTitle(t("statusBar.snapshot"))
+              .setIcon("camera")
+              .onClick(async () => {
+                await this.saveSnapshotForFile(file);
+              });
+          });
+          menu.addItem((item) => {
+            item
+              .setTitle(t("statusBar.history"))
+              .setIcon("history")
+              .onClick(() => {
+                new EditHistoryModal(this.app, file.path).open();
+              });
+          });
+        }
+      })
+    );
+
+    // Ensure chat view exists on layout ready
+    this.app.workspace.onLayoutReady(() => {
+      void this.ensureChatViewExists();
+    });
+
+    // Track active markdown view and capture selection when switching to chat
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        if (leaf?.view?.getViewType() === VIEW_TYPE_GEMINI_CHAT) {
+          // Capture selection from the last active markdown view
+          this.captureSelectionFromView(this.lastActiveMarkdownView);
+          // Notify Chat component that it's now active
+          this.settingsEmitter.emit("chat-activated");
+        } else {
+          // Leaving chat view - clear the highlight
+          this.clearSelectionHighlight();
+          if (leaf?.view instanceof MarkdownView) {
+            // Track the last active markdown view
+            this.lastActiveMarkdownView = leaf.view;
+          }
+        }
+      })
+    );
+
+    // Add ribbon icon
+    this.addRibbonIcon("brain-circuit", "Open chat", () => {
+      void this.activateChatView();
+    });
+
+    // Add command to open chat
+    this.addCommand({
+      id: "open-chat",
+      name: "Open chat",
+      callback: () => {
+        void this.activateChatView();
+      },
+    });
+
+    // Add command to toggle between chat and markdown view
+    this.addCommand({
+      id: "toggle-chat",
+      name: "Toggle chat / editor",
+      callback: () => {
+        this.toggleChatView();
+      },
+    });
+
+    // Add command to open a real TTY-backed CLI terminal in the vault root
+    this.addCommand({
+      id: "open-cli-terminal",
+      name: "Open CLI terminal",
+      callback: () => {
+        void this.activateCliTerminalView();
+      },
+    });
+
+    // Add command to show edit history
+    this.addCommand({
+      id: "show-edit-history",
+      name: t("command.showEditHistory"),
+      checkCallback: (checking: boolean) => {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile) {
+          if (!checking) {
+            new EditHistoryModal(this.app, activeFile.path).open();
+          }
+          return true;
+        }
+        return false;
+      },
+    });
+
+    // Add command to restore previous version
+    this.addCommand({
+      id: "restore-previous-version",
+      name: t("command.restorePreviousVersion"),
+      checkCallback: (checking: boolean) => {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile) {
+          if (!checking) {
+            void this.restorePreviousVersion(activeFile.path);
+          }
+          return true;
+        }
+        return false;
+      },
+    });
+
+    // Add command to encrypt current file
+    this.addCommand({
+      id: "encrypt-file",
+      name: t("command.encryptFile"),
+      checkCallback: (checking: boolean) => {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile && activeFile.extension === "md") {
+          if (!checking) {
+            void this.encryptFile(activeFile);
+          }
+          return true;
+        }
+        return false;
+      },
+    });
+
+    // Add command to decrypt current file
+    this.addCommand({
+      id: "decrypt-file",
+      name: t("command.decryptFile"),
+      checkCallback: (checking: boolean) => {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile && (activeFile.extension === "md" || activeFile.extension === "encrypted")) {
+          if (!checking) {
+            void this.decryptCurrentFile(activeFile);
+          }
+          return true;
+        }
+        return false;
+      },
+    });
+
+    // Add command to run workflow
+    this.addCommand({
+      id: "run-workflow",
+      name: t("command.runWorkflow"),
+      callback: () => {
+        new WorkflowSelectorModal(this.app, this, (filePath) => {
+          void this.executeWorkflowFromHotkey(filePath);
+        }).open();
+      },
+    });
+
+    // Register file events for edit history
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        if (file instanceof TFile && file.extension === "md") {
+          const historyManager = getEditHistoryManager();
+          if (historyManager) {
+            historyManager.handleFileRename(oldPath, file.path);
+          }
+        }
+      })
+    );
+
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (file instanceof TFile && file.extension === "md") {
+          const historyManager = getEditHistoryManager();
+          if (historyManager) {
+            historyManager.handleFileDelete(file.path);
+          }
+        }
+      })
+    );
+
+    // Initialize snapshot when a file is opened (for edit history)
+    // Also check if .md file is encrypted and redirect to CryptView
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        if (file instanceof TFile) {
+          if (file.extension === "md") {
+            const historyManager = getEditHistoryManager();
+            if (historyManager) {
+              void historyManager.initSnapshot(file.path);
+            }
+
+            // Check if file is encrypted and redirect to CryptView
+            void this.checkAndOpenEncryptedFile(file);
+          }
+        }
+      })
+    );
+
+  }
+
+  /**
+   * Save a snapshot for a specific file
+   */
+  private async saveSnapshotForFile(file: TFile): Promise<void> {
+    const historyManager = getEditHistoryManager();
+    if (!historyManager) {
+      new Notice(t("editHistory.notInitialized"));
+      return;
+    }
+
+    await historyManager.ensureSnapshot(file.path);
+    const entry = historyManager.saveEdit({
+      path: file.path,
+      modifiedContent: await this.app.vault.read(file),
+      source: "manual",
+    });
+
+    if (entry) {
+      new Notice(t("statusBar.snapshotSaved"));
+    } else {
+      new Notice(t("editHistory.noChanges"));
+    }
+  }
+
+  /**
+   * Save a snapshot for the active file
+   */
+  private async saveSnapshotForActiveFile(): Promise<void> {
+    const activeFile = this.app.workspace.getActiveFile();
+    if (!activeFile) {
+      new Notice(t("editHistory.noActiveFile"));
+      return;
+    }
+    await this.saveSnapshotForFile(activeFile);
+  }
+
+  private async restorePreviousVersion(filePath: string): Promise<void> {
+    const historyManager = getEditHistoryManager();
+    if (!historyManager) {
+      new Notice("Edit history manager not initialized");
+      return;
+    }
+
+    const history = historyManager.getHistory(filePath);
+    if (history.length === 0) {
+      new Notice(t("editHistoryModal.noHistory"));
+      return;
+    }
+
+    // Get the most recent entry and restore to before that change
+    const lastEntry = history[history.length - 1];
+
+    // Show confirmation modal
+    const confirmed = await new Promise<boolean>((resolve) => {
+      const modal = new Modal(this.app);
+      modal.contentEl.createEl("p", { text: t("editHistoryModal.confirmRestore") });
+      const buttonContainer = modal.contentEl.createDiv({ cls: "modal-button-container" });
+      buttonContainer.createEl("button", { text: t("common.cancel") }).addEventListener("click", () => {
+        modal.close();
+        resolve(false);
+      });
+      buttonContainer.createEl("button", { text: t("common.confirm"), cls: "mod-warning" }).addEventListener("click", () => {
+        modal.close();
+        resolve(true);
+      });
+      modal.open();
+    });
+
+    if (confirmed) {
+      await historyManager.restoreTo(filePath, lastEntry.id);
+      const date = new Date(lastEntry.timestamp);
+      const timeStr = date.toLocaleString();
+      new Notice(t("editHistoryModal.restored", { timestamp: timeStr }));
+    }
+  }
+
+  onunload(): void {
+    this.clearSelectionHighlight();
+    resetLangfuse();
+    resetGeminiClient();
+    resetLocalRagStore();
+    resetEditHistoryManager();
+    resetDiscordService();
+
+    // Restore workspace folder visibility on unload
+    document.body.classList.remove("llm-hub-hide-workspace-folder");
+
+    // Clean up workflow timers
+    this.workflowMgr.cleanup();
+
+  }
+
+  async loadSettings(): Promise<void> {
+    const savedData = await this.loadData() as Partial<LlmHubSettings> | null;
+    const isExistingInstall = savedData !== null && Object.keys(savedData).length > 0;
+    const loaded = savedData ?? {};
+
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...loaded,
+      maxSavedChatHistories: loaded.maxSavedChatHistories
+        ?? (isExistingInstall ? 0 : DEFAULT_SETTINGS.maxSavedChatHistories),
+      skillsFolder: typeof loaded.skillsFolder === "string"
+        ? loaded.skillsFolder
+        : (typeof loaded.skillsFolderPath === "string" ? loaded.skillsFolderPath : DEFAULT_SETTINGS.skillsFolder),
+      // Explicitly clear the pre-migration key so it doesn't get persisted back by saveSettings.
+      skillsFolderPath: undefined,
+      cliConfig: normaliseCliConfig(loaded),
+      // Deep copy arrays to avoid mutating DEFAULT_SETTINGS
+      // Use loaded commands if present, otherwise use default commands
+      slashCommands: loaded.slashCommands
+        ? loaded.slashCommands.map(cmd => {
+            const searchSelection = getSlashCommandSearchSelection(cmd);
+            const { searchSetting: _legacySearchSetting, ...rest } = cmd;
+            return {
+              ...rest,
+              model: normalizeModelSetting(cmd.model),
+              searchSelection,
+            };
+          })
+        : [...DEFAULT_SETTINGS.slashCommands],
+      // Deep copy API providers (ensure enabledModels exists)
+      apiProviders: loaded.apiProviders
+        ? loaded.apiProviders.map(p => ({
+            ...p,
+            enabledModels: normalizeModelList(p.enabledModels),
+            availableModels: normalizeModelList(p.availableModels),
+          }))
+        : [...DEFAULT_SETTINGS.apiProviders],
+      // Deep copy MCP servers (add default transport for backward compatibility)
+      mcpServers: loaded.mcpServers
+        ? loaded.mcpServers.map(s => ({
+            ...s,
+            transport: s.transport || "http",
+          }))
+        : [...DEFAULT_SETTINGS.mcpServers],
+      xdfAutoBindToolkits: loaded.xdfAutoBindToolkits !== false,
+      agentPlugins: Array.isArray(loaded.agentPlugins) ? loaded.agentPlugins : [],
+      // Deep copy workflow arrays
+      enabledWorkflowHotkeys: loaded.enabledWorkflowHotkeys
+        ? [...loaded.enabledWorkflowHotkeys]
+        : [],
+      enabledWorkflowEventTriggers: loaded.enabledWorkflowEventTriggers
+        ? [...loaded.enabledWorkflowEventTriggers]
+        : [],
+      cloudVaultToolAllowedFolders: Array.isArray(loaded.cloudVaultToolAllowedFolders)
+        ? loaded.cloudVaultToolAllowedFolders.map((folder: unknown) => String(folder).trim()).filter(Boolean)
+        : [],
+      // Deep merge editHistory settings
+      editHistory: {
+        ...DEFAULT_EDIT_HISTORY_SETTINGS,
+        ...(loaded.editHistory ?? {}),
+        diff: {
+          ...DEFAULT_EDIT_HISTORY_SETTINGS.diff,
+          ...(loaded.editHistory?.diff ?? {}),
+        },
+      },
+      // Deep merge langfuse settings
+      langfuse: {
+        ...DEFAULT_LANGFUSE_SETTINGS,
+        ...(loaded.langfuse ?? {}),
+      },
+      // Local LLM settings — normalised to an array of entries. Legacy
+      // singleton (`localLlmConfig`) is migrated into the array on first load.
+      localLlmConfigs: normaliseLocalLlmConfigs(loaded),
+      // Explicitly clear the pre-migration keys so they don't get persisted
+      // back by saveSettings (which diffs against DEFAULT_SETTINGS).
+      localLlmConfig: undefined,
+      localLlmVerified: undefined,
+      localLlmAvailableModels: undefined,
+      // Deep merge Discord settings
+      discord: {
+        ...DEFAULT_DISCORD_SETTINGS,
+        ...(loaded.discord ?? {}),
+        model: normalizeModelSetting(loaded.discord?.model ?? DEFAULT_DISCORD_SETTINGS.model),
+      },
+    };
+    this.settings.lastAIWorkflowModel = normalizeModelSetting(this.settings.lastAIWorkflowModel);
+    this.settings.lastTimelineAiModel = normalizeModelSetting(this.settings.lastTimelineAiModel);
+
+    // Overlay credentials held in SecretStorage. This runs in both storage modes
+    // so that a device still holding the secrets can recover values that another
+    // device stripped from data.json.
+    const stored = readSecretJson<SettingsCredentialBundle>(this.app, SETTINGS_CREDENTIAL_SECRET_ID);
+    if (stored) applySettingsCredentials(this.settings, stored);
+  }
+
+  /** True when new credential writes should go to Obsidian's SecretStorage. */
+  isSecretCredentialStorage(): boolean {
+    return this.settings.credentialStorage === "secretStorage" && isSecretStorageAvailable(this.app);
+  }
+
+  /**
+   * Hint shown next to an empty credential field when that slot is known to be
+   * configured on another device.
+   */
+  credentialConfiguredElsewhere(slot: string, currentValue: string | undefined): boolean {
+    if (!this.isSecretCredentialStorage()) return false;
+    if (currentValue) return false;
+    return this.settings.configuredCredentials?.includes(slot) ?? false;
+  }
+
+  async saveSettings() {
+    // Credentials go to SecretStorage first: if that write fails we keep the
+    // plaintext copy rather than stripping away the only copy we have.
+    let settingsForPersistence = this.settings;
+    if (this.isSecretCredentialStorage()) {
+      const stored = writeSecretJson(
+        this.app,
+        SETTINGS_CREDENTIAL_SECRET_ID,
+        collectSettingsCredentials(this.settings),
+      );
+      if (stored) {
+        this.settings.configuredCredentials = mergeConfiguredCredentials(
+          this.settings,
+          this.settings.configuredCredentials,
+        );
+        settingsForPersistence = stripSettingsCredentials(this.settings);
+      } else {
+        new Notice(t("settings.credentialStorage.writeFailed"), 10000);
+      }
+    } else if (this.settings.configuredCredentials) {
+      this.settings.configuredCredentials = undefined;
+    }
+
+    // Only save values that differ from defaults
+    const dataToSave: Partial<LlmHubSettings> = {};
+    for (const key of Object.keys(settingsForPersistence) as (keyof LlmHubSettings)[]) {
+      const currentValue = settingsForPersistence[key];
+      const defaultValue = DEFAULT_SETTINGS[key];
+      // Use JSON.stringify for arrays/objects comparison
+      const isDifferent = Array.isArray(currentValue) || (typeof currentValue === 'object' && currentValue !== null)
+        ? JSON.stringify(currentValue) !== JSON.stringify(defaultValue)
+        : currentValue !== defaultValue;
+      if (isDifferent) {
+        (dataToSave as Record<string, unknown>)[key] = currentValue;
+      }
+    }
+    // Always persist workspaceFolder to survive migrations and plugin updates
+    (dataToSave as Record<string, unknown>).workspaceFolder = this.settings.workspaceFolder;
+    await this.saveData(dataToSave);
+    this.settingsEmitter.emit("settings-updated", this.settings);
+
+    // Always reinitialize clients to pick up any config changes
+    this.initializeClients();
+
+    // Re-register workflow hotkeys
+    this.registerWorkflowHotkeys();
+  }
+
+  registerWorkflowHotkeys(): void {
+    this.workflowMgr.registerHotkeys();
+  }
+
+  async executeWorkflowFromHotkey(filePath: string): Promise<void> {
+    return this.workflowMgr.executeFromHotkey(filePath);
+  }
+
+  registerWorkflowEventListeners(): void {
+    this.workflowMgr.registerEventListeners();
+  }
+
+  // ========================================
+  // Workspace State Methods (delegated to WorkspaceStateManager)
+  // ========================================
+
+  getWorkspaceStateFilePath(): string {
+    return this.wsManager.getWorkspaceStateFilePath();
+  }
+
+  async loadWorkspaceState(): Promise<void> {
+    await this.wsManager.loadWorkspaceState();
+    this.settingsEmitter.emit("workspace-state-loaded", this.workspaceState);
+  }
+
+  async loadOrCreateWorkspaceState(): Promise<void> {
+    return this.wsManager.loadOrCreateWorkspaceState();
+  }
+
+  async saveWorkspaceState(): Promise<void> {
+    return this.wsManager.saveWorkspaceState();
+  }
+
+  /**
+   * Show or hide the workspace folder in the file explorer.
+   *
+   * Toggles a body class; the actual `display: none` lives in styles.css and
+   * targets the default folder name (`LLMHub`) via an attribute selector. A
+   * pure-CSS rule on `document.body` survives file-explorer re-renders without
+   * any DOM observer dance.
+   *
+   * Limitation: only hides the default workspace folder path. Custom paths
+   * (`workspaceFolder` renamed away from `LLMHub`) are not covered — the
+   * workspace folder UI can always be used to revert the rename.
+   */
+  updateWorkspaceFolderVisibility(): void {
+    document.body.classList.toggle(
+      "llm-hub-hide-workspace-folder",
+      this.settings.hideWorkspaceFolder
+    );
+  }
+
+  getSelectedRagSetting(): RagSetting | null {
+    return this.wsManager.getSelectedRagSetting();
+  }
+
+  getRagSetting(name: string): RagSetting | null {
+    return this.wsManager.getRagSetting(name);
+  }
+
+  getRagSearchSetting(name: string): RagSetting | null {
+    const setting = this.getRagSetting(name);
+    if (!setting) return null;
+    const sourceName = setting.sourceRagSettings[0];
+    const sourceSetting = sourceName ? this.getRagSetting(sourceName) : null;
+    if (!sourceSetting) return setting;
+    return {
+      ...setting,
+      embeddingApiKey: sourceSetting.embeddingApiKey,
+      embeddingBaseUrl: sourceSetting.embeddingBaseUrl,
+      embeddingModel: sourceSetting.embeddingModel,
+    };
+  }
+
+  getRagSettingNames(): string[] {
+    return this.wsManager.getRagSettingNames();
+  }
+
+  async selectRagSetting(name: string | null): Promise<void> {
+    return this.wsManager.selectRagSetting(name);
+  }
+
+  async selectSearchSelection(selection: import("./types").SearchSelection): Promise<void> {
+    return this.wsManager.selectSearchSelection(selection);
+  }
+
+  async selectModel(model: ModelType): Promise<void> {
+    return this.wsManager.selectModel(model);
+  }
+
+  getSelectedModel(): ModelType {
+    return this.wsManager.getSelectedModel();
+  }
+
+  async createRagSetting(name: string, setting?: Partial<RagSetting>): Promise<void> {
+    return this.wsManager.createRagSetting(name, setting);
+  }
+
+  async updateRagSetting(name: string, updates: Partial<RagSetting>): Promise<void> {
+    return this.wsManager.updateRagSetting(name, updates);
+  }
+
+  async deleteRagSetting(name: string): Promise<void> {
+    return this.wsManager.deleteRagSetting(name);
+  }
+
+  async renameRagSetting(oldName: string, newName: string): Promise<void> {
+    return this.wsManager.renameRagSetting(oldName, newName);
+  }
+
+  async resetRagSettingSyncState(name: string): Promise<void> {
+    return this.wsManager.resetRagSettingSyncState(name);
+  }
+
+  getVaultStoreName(): string {
+    return this.wsManager.getVaultStoreName();
+  }
+
+  // Migrate from old settings format (plugin-specific parts)
+  private async migrateSlashCommands(): Promise<void> {
+    // Add default infographic command if not present
+    const hasInfographicCommand = this.settings.slashCommands.some(
+      (cmd) => cmd.name === "infographic"
+    );
+    if (!hasInfographicCommand) {
+      this.settings.slashCommands.push({
+        id: "cmd_infographic_default",
+        name: "infographic",
+        promptTemplate: "Convert the following content into an HTML infographic. Output the HTML directly in your response, do not create a note:\n\n{selection}",
+        model: null,
+        description: "Generate HTML infographic from selection or active note",
+        searchSelection: null,
+      });
+      await this.saveSettings();
+    }
+  }
+
+  private initializeClients() {
+    // Only initialize Gemini API client when a Gemini provider is configured
+    const geminiApiKey = getGeminiApiKey(this.settings);
+    if (geminiApiKey) {
+      // Use first available model from Gemini provider, or a reasonable default
+      const geminiProvider = this.settings.apiProviders.find(p => p.type === "gemini" && p.enabled);
+      const defaultModel = geminiProvider?.enabledModels[0] || "gemini-3.8-flash";
+      initGeminiClient(geminiApiKey, defaultModel as ModelType, this.settings.proxyUrl, this.settings.proxyBypass);
+    }
+    initLangfuse(this.settings.langfuse);
+
+    // Initialize CLI provider manager
+    initCliProviderManager();
+
+    // Initialize edit history manager
+    const editHistorySettings = this.settings.editHistory || DEFAULT_EDIT_HISTORY_SETTINGS;
+    initEditHistoryManager(this.app, editHistorySettings);
+
+    // Initialize local RAG store and preload existing index
+    const localRag = initLocalRagStore();
+    localRag.workspaceFolder = this.settings.workspaceFolder || DEFAULT_WORKSPACE_FOLDER;
+    void localRag.load(
+      this.app,
+      Object.keys(this.workspaceState.ragSettings),
+      this.workspaceState.ragSettings
+    );
+
+    // Start Discord bot if enabled
+    const discordConfig = this.settings.discord;
+    if (discordConfig?.enabled && discordConfig.botToken) {
+      try {
+        const discordService = initDiscordService(this.app, this);
+        discordService.start();
+      } catch (e) {
+        console.error("LLM Hub: Failed to start Discord bot:", formatError(e));
+      }
+    }
+
+  }
+
+  private async ensureChatViewExists() {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_GEMINI_CHAT);
+    if (leaves.length === 0) {
+      let leaf = this.app.workspace.getRightLeaf(false);
+      if (!leaf) {
+        leaf = this.app.workspace.getRightLeaf(true);
+      }
+      if (leaf) {
+        await leaf.setViewState({
+          type: VIEW_TYPE_GEMINI_CHAT,
+          active: false,
+        });
+      }
+    }
+  }
+
+  async activateCliTerminalView(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf: WorkspaceLeaf | null = null;
+
+    const existingLeaves = workspace.getLeavesOfType(CLI_TERMINAL_VIEW_TYPE);
+    if (existingLeaves.length > 0) {
+      leaf = existingLeaves[0];
+    } else {
+      leaf = workspace.getRightLeaf(false);
+      if (!leaf) {
+        leaf = workspace.getRightLeaf(true);
+      }
+      if (leaf) {
+        await leaf.setViewState({
+          type: CLI_TERMINAL_VIEW_TYPE,
+          active: true,
+        });
+      }
+    }
+
+    if (leaf) {
+      void workspace.revealLeaf(leaf);
+    }
+  }
+
+  /** Delegate dashboard creation to the standalone Dashboard Hub plugin. */
+  async createDashboard(requestedName = "Dashboard"): Promise<TFile | null> {
+    const app = this.app as typeof this.app & {
+      plugins?: { plugins?: Record<string, unknown> };
+    };
+    const dashboardHub = app.plugins?.plugins?.["dashboard-hub"] as DashboardHubApi | undefined;
+    if (!dashboardHub?.createDashboard) {
+      new Notice("Install and enable Dashboard Hub to create dashboards.");
+      return null;
+    }
+    return dashboardHub.createDashboard(requestedName);
+  }
+
+  private notifyDashboardHubMigration(): void {
+    this.app.workspace.onLayoutReady(() => {
+      const app = this.app as typeof this.app & {
+        plugins?: {
+          plugins?: Record<string, unknown>;
+          enabledPlugins?: { has: (id: string) => boolean };
+        };
+      };
+      if (app.plugins?.plugins?.["dashboard-hub"] || app.plugins?.enabledPlugins?.has("dashboard-hub")) return;
+      if (!app.vault.getFiles().some((file) => file.extension === "dashboard")) return;
+      if (this.settings.dashboardHubMigrationNoticeShown) return;
+
+      this.settings.dashboardHubMigrationNoticeShown = true;
+      void this.saveSettings().catch((error) => {
+        console.error("LLM Hub: Failed to persist Dashboard Hub migration notice:", formatError(error));
+      });
+      new Notice("Existing .dashboard files now require the separate Dashboard Hub plugin. Install and enable Dashboard Hub to open them.", 15000);
+    });
+  }
+
+  private registerDashboardHubIntegration(): void {
+    const integration: DashboardHubIntegration = {
+      protocolVersion: 1,
+      id: this.manifest.id,
+      name: this.manifest.name,
+      listModels: () => Promise.resolve(listDashboardModels(this)),
+      getDefaultModel: () => Promise.resolve(this.getSelectedModel()),
+      openChatWithDraft: (draft) => this.openChatWithDraft(draft),
+      askChatAboutSelection: (request) => this.askChatAboutSelection(request),
+      runWorkflow: (request) => runDashboardWorkflow(this, request),
+      generateBase: (request) => generateDashboardBase(this, request),
+      rewriteText: (request) => rewriteDashboardText(this, request),
+      generateWorkflow: (request) => generateDashboardWorkflow(this, request),
+    };
+    const workspace = this.app.workspace as unknown as DashboardWorkspaceEvents;
+    this.registerEvent(workspace.on("dashboard-hub:ready", (hub) => {
+      hub.registerIntegration(integration);
+    }));
+    workspace.trigger("dashboard-hub:register-integration", integration);
+    this.register(() => {
+      workspace.trigger("dashboard-hub:unregister-integration", { id: integration.id, integration });
+    });
+  }
+
+  private registerRuntimeSkillContributions(): void {
+    const workspace = this.app.workspace as unknown as {
+      on: (name: string, callback: (value: unknown) => void) => EventRef;
+      trigger: (name: string) => void;
+    };
+    this.registerEvent(workspace.on(REGISTER_RUNTIME_SKILL_EVENT, (value) => {
+      if (registerRuntimeSkill(value)) this.settingsEmitter.emit("skills-changed");
+    }));
+    this.registerEvent(workspace.on(UNREGISTER_RUNTIME_SKILL_EVENT, (value) => {
+      if (unregisterRuntimeSkill(value)) this.settingsEmitter.emit("skills-changed");
+    }));
+    workspace.trigger(REQUEST_RUNTIME_SKILLS_EVENT);
+  }
+
+  async activateChatView(): Promise<void> {
+    // Capture selection before switching focus
+    this.captureSelection();
+
+    const { workspace } = this.app;
+    let leaf: WorkspaceLeaf | null = null;
+
+    const existingLeaves = workspace.getLeavesOfType(VIEW_TYPE_GEMINI_CHAT);
+    if (existingLeaves.length > 0) {
+      leaf = existingLeaves[0];
+    } else {
+      leaf = workspace.getRightLeaf(false);
+      if (leaf) {
+        await leaf.setViewState({
+          type: VIEW_TYPE_GEMINI_CHAT,
+          active: true,
+        });
+      }
+    }
+
+    if (leaf) {
+      void workspace.revealLeaf(leaf);
+    }
+  }
+
+  async openDiscussionHub(request: { theme?: string; attachments?: import("src/types").Attachment[] } = {}): Promise<void> {
+    const hub = this.getDiscussionHubApi();
+    if (!hub?.openDiscussion) {
+      new Notice("Install and enable Discussion Hub to use AI Discussion.");
+      return;
+    }
+    await hub.openDiscussion(request);
+  }
+
+  getDiscussionHubApi(): DiscussionHubApi | null {
+    const app = this.app as typeof this.app & { plugins?: { plugins?: Record<string, unknown> } };
+    return (app.plugins?.plugins?.["discussion-hub"] as DiscussionHubApi | undefined) ?? null;
+  }
+
+  async askChatAboutSelection(selection: { text: string; sourcePath?: string }): Promise<void> {
+    const text = selection.text.trim();
+    if (!text) return;
+
+    const { workspace } = this.app;
+    let leaf: WorkspaceLeaf | null = workspace.getLeavesOfType(VIEW_TYPE_GEMINI_CHAT)[0] ?? null;
+    if (!leaf) {
+      leaf = workspace.getRightLeaf(false);
+      if (leaf) {
+        await leaf.setViewState({
+          type: VIEW_TYPE_GEMINI_CHAT,
+          active: true,
+        });
+      }
+    }
+    if (!leaf) return;
+
+    await workspace.revealLeaf(leaf);
+    for (let i = 0; i < 10; i++) {
+      await new Promise((resolve) => window.setTimeout(resolve, 30));
+      const view = leaf.view instanceof ChatView ? leaf.view : null;
+      if (view) {
+        view.askSelection({ text, sourcePath: selection.sourcePath });
+        this.settingsEmitter.emit("chat-activated");
+        return;
+      }
+    }
+  }
+
+  async openChatWithDraft(content: string): Promise<void> {
+    const draft = content.trim();
+    if (!draft) return;
+
+    const { workspace } = this.app;
+    let leaf: WorkspaceLeaf | null = workspace.getLeavesOfType(VIEW_TYPE_GEMINI_CHAT)[0] ?? null;
+    if (!leaf) {
+      leaf = workspace.getRightLeaf(false);
+      if (leaf) {
+        await leaf.setViewState({
+          type: VIEW_TYPE_GEMINI_CHAT,
+          active: true,
+        });
+      }
+    }
+    if (!leaf) return;
+
+    await workspace.revealLeaf(leaf);
+    for (let i = 0; i < 10; i++) {
+      await new Promise((resolve) => window.setTimeout(resolve, 30));
+      const view = leaf.view instanceof ChatView ? leaf.view : null;
+      if (view) {
+        view.setChatDraft(draft);
+        this.settingsEmitter.emit("chat-activated");
+        return;
+      }
+    }
+  }
+
+  // Toggle between chat view and last active markdown view
+  private toggleChatView(): void {
+    const chatLeaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_GEMINI_CHAT);
+    const activeChatView = this.app.workspace.getActiveViewOfType(ChatView);
+
+    if (activeChatView) {
+      // Currently in chat, go back to last markdown view
+      if (this.lastActiveMarkdownView?.leaf) {
+        this.clearSelectionHighlight();
+        this.app.workspace.setActiveLeaf(this.lastActiveMarkdownView.leaf, { focus: true });
+      }
+    } else {
+      // Not in chat, capture selection and open/activate chat
+      this.captureSelectionFromView(this.lastActiveMarkdownView);
+      if (chatLeaves.length > 0) {
+        this.app.workspace.setActiveLeaf(chatLeaves[0], { focus: true });
+        // Notify Chat component that it's now active
+        this.settingsEmitter.emit("chat-activated");
+      } else {
+        void this.activateChatView();
+      }
+    }
+  }
+
+  // Capture selection from a specific markdown view
+  private captureSelectionFromView(view: MarkdownView | null): void {
+    this.selectionManager.captureSelectionFromView(view);
+  }
+
+  captureSelection(): void {
+    this.selectionManager.captureSelection();
+  }
+
+  clearSelectionHighlight(): void {
+    this.selectionManager.clearSelectionHighlight();
+  }
+
+  getLastSelection(): string {
+    return this.selectionManager.getLastSelection();
+  }
+
+  getSelectionLocation(): SelectionLocationInfo | null {
+    return this.selectionManager.getSelectionLocation();
+  }
+
+  clearLastSelection(): void {
+    this.selectionManager.clearLastSelection();
+  }
+
+  // Sync vault for local RAG (embedding-based)
+  async syncVaultForLocalRAG(
+    ragSettingName: string,
+    onProgress?: (current: number, total: number, fileName: string, action: "embed" | "skip" | "remove") => void
+  ): Promise<{ embedded: number; skipped: number; removed: number; errors: string[]; failedFiles?: string[] } | null> {
+    const localRag = getLocalRagStore();
+    if (!localRag) {
+      new Notice(t("chat.clientNotInitialized"));
+      return null;
+    }
+
+    const ragSetting = this.workspaceState.ragSettings[ragSettingName];
+    if (!ragSetting) {
+      new Notice(`Semantic search setting "${ragSettingName}" not found.`);
+      return null;
+    }
+
+    if (ragSetting.externalIndexPath || ragSetting.sourceRagSettings.length > 0) {
+      new Notice(t("settings.externalIndexSyncDisabled"));
+      return null;
+    }
+
+    const embeddingApiKey = ragSetting.embeddingApiKey || getGeminiApiKey(this.settings);
+    if (!ragSetting.embeddingBaseUrl && !embeddingApiKey) {
+      new Notice("API key is required for embedding (set Google API key or custom embedding API key)");
+      return null;
+    }
+
+    try {
+      const effectiveModel = ragSetting.embeddingModel || (ragSetting.embeddingBaseUrl ? "" : DEFAULT_GEMINI_EMBEDDING_MODEL);
+      // Auto-enable multimodal indexing:
+      // - Gemini native embedding models: full multimodal (PDF binary, images, audio, video)
+      // - Non-Gemini (custom base URL): PDF only via text extraction
+      const indexMultimodal = !ragSetting.embeddingBaseUrl
+        ? isGeminiMultimodalEmbeddingModel(effectiveModel)
+        : true;
+      const failedFiles = new Set<string>();
+      let result = await localRag.sync(
+        this.app,
+        ragSettingName,
+        embeddingApiKey,
+        effectiveModel,
+        ragSetting.chunkSize,
+        ragSetting.chunkOverlap,
+        ragSetting.pdfChunkPages ?? 6,
+        {
+          includeFolders: ragSetting.targetFolders,
+          excludePatterns: ragSetting.excludePatterns,
+        },
+        onProgress,
+        ragSetting.embeddingBaseUrl || undefined,
+        indexMultimodal,
+        this.settings.proxyUrl,
+        this.settings.proxyBypass,
+      );
+      result.failedFiles?.forEach(filePath => failedFiles.add(filePath));
+      while (result.deferredFiles) {
+        result = await localRag.sync(
+          this.app,
+          ragSettingName,
+          embeddingApiKey,
+          effectiveModel,
+          ragSetting.chunkSize,
+          ragSetting.chunkOverlap,
+          ragSetting.pdfChunkPages ?? 6,
+          {
+            includeFolders: ragSetting.targetFolders,
+            excludePatterns: ragSetting.excludePatterns,
+          },
+          onProgress,
+          ragSetting.embeddingBaseUrl || undefined,
+          indexMultimodal,
+          this.settings.proxyUrl,
+          this.settings.proxyBypass,
+        );
+        result.failedFiles?.forEach(filePath => failedFiles.add(filePath));
+      }
+
+      // Update sync metadata
+      this.workspaceState.ragSettings[ragSettingName] = {
+        ...ragSetting,
+        lastFullSync: result.errors.length === 0 ? Date.now() : ragSetting.lastFullSync,
+      };
+      await this.saveWorkspaceState();
+      this.settingsEmitter.emit("workspace-state-loaded", this.workspaceState);
+
+      return { ...result, failedFiles: Array.from(failedFiles) };
+    } catch (error) {
+      throw (error instanceof Error ? error : new Error(formatError(error)));
+    }
+  }
+
+  // Clear local RAG index
+  async clearLocalRagIndex(ragSettingName: string): Promise<void> {
+    const ragSetting = this.workspaceState.ragSettings[ragSettingName];
+    if (ragSetting?.externalIndexPath || ragSetting?.sourceRagSettings.length) {
+      new Notice(t("settings.externalIndexSyncDisabled"));
+      return;
+    }
+
+    const localRag = getLocalRagStore();
+    if (localRag) {
+      await localRag.clear(this.app, ragSettingName);
+    }
+
+    if (ragSetting) {
+      this.workspaceState.ragSettings[ragSettingName] = {
+        ...ragSetting,
+        lastFullSync: null,
+      };
+      await this.saveWorkspaceState();
+      this.settingsEmitter.emit("workspace-state-loaded", this.workspaceState);
+    }
+  }
+
+  // Get slash commands for workflow
+  getSlashCommands(): SlashCommand[] {
+    return this.settings.slashCommands;
+  }
+
+  // Execute a slash command for workflow
+  async executeSlashCommand(
+    commandIdOrName: string,
+    options?: {
+      value?: string;
+      contentPath?: string;
+      selection?: { path: string; start: unknown; end: unknown };
+      chatId?: string;
+    }
+  ): Promise<{ response: string; chatId: string }> {
+    // Find the command
+    const command = this.settings.slashCommands.find(
+      (cmd) => cmd.id === commandIdOrName || cmd.name === commandIdOrName
+    );
+
+    if (!command) {
+      throw new Error(`Slash command not found: ${commandIdOrName}`);
+    }
+
+    // Get the content to use
+    let content = "";
+    if (options?.value) {
+      content = options.value;
+    } else if (options?.contentPath) {
+      // Read content from file
+      const file = this.app.vault.getAbstractFileByPath(options.contentPath);
+      if (file instanceof TFile) {
+        content = await this.app.vault.read(file);
+      }
+    } else if (options?.selection) {
+      // Read content from selection
+      const selectionPath = options.selection.path;
+      const file = this.app.vault.getAbstractFileByPath(selectionPath);
+      if (file instanceof TFile) {
+        const fileContent = await this.app.vault.read(file);
+        // For now, just use the whole file content
+        // TODO: Extract selection range
+        content = fileContent;
+      }
+    }
+
+    // Replace {selection} placeholder in template
+    const prompt = command.promptTemplate.replace(/\{selection\}/g, content);
+
+    // Get the Gemini client
+    const client = getGeminiClient();
+    if (!client) {
+      throw new Error("Gemini client not initialized");
+    }
+
+    // Set model if specified
+    if (command.model) {
+      client.setModel(command.model);
+    }
+
+    // Send message
+    const response = await client.chat(
+      [{ role: "user", content: prompt, timestamp: Date.now() }],
+      this.settings.systemPrompt || undefined
+    );
+
+    // Generate or use existing chatId
+    const chatId = options?.chatId || `workflow-${Date.now()}`;
+
+    return { response, chatId };
+  }
+
+  // ========================================
+  // Encryption Methods
+  // ========================================
+
+  /**
+   * Encrypt a file
+   */
+  async encryptFile(file: TFile): Promise<void> {
+    return this.encryptionManager.encryptFile(file);
+  }
+
+  private async checkAndOpenEncryptedFile(file: TFile): Promise<void> {
+    return this.encryptionManager.checkAndOpenEncryptedFile(file);
+  }
+
+  async decryptCurrentFile(file: TFile): Promise<void> {
+    return this.encryptionManager.decryptCurrentFile(file);
+  }
+}

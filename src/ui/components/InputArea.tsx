@@ -1,0 +1,1095 @@
+import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent, ChangeEvent, forwardRef, useImperativeHandle } from "react";
+import Send from "lucide-react/dist/esm/icons/send";
+import Paperclip from "lucide-react/dist/esm/icons/paperclip";
+import StopCircle from "lucide-react/dist/esm/icons/stop-circle";
+import Loader2 from "lucide-react/dist/esm/icons/loader-2";
+import Eye from "lucide-react/dist/esm/icons/eye";
+import Database from "lucide-react/dist/esm/icons/database";
+import ChevronUp from "lucide-react/dist/esm/icons/chevron-up";
+import ChevronDown from "lucide-react/dist/esm/icons/chevron-down";
+import Wrench from "lucide-react/dist/esm/icons/wrench";
+import X from "lucide-react/dist/esm/icons/x";
+import { Notice, Platform, type App } from "obsidian";
+import { isImageGenerationModel, type ModelInfo, type ModelType, type Attachment, type SlashCommand, type McpServerConfig, type SearchSelection, type VaultToolMode, type CodexReasoningEffort } from "src/types";
+import type { CodexModelOption } from "src/core/cliProvider";
+import { RagSourceModal } from "./RagSourceModal";
+import type { SkillMetadata } from "src/core/skillsLoader";
+import type { OkfBundle } from "src/core/okfLoader";
+import SkillSelector from "./SkillSelector";
+import OkfSelector from "./OkfSelector";
+import { isThinkingRequired } from "src/core/gemini";
+import { t } from "src/i18n";
+import { isCaretOnFirstLine, isCaretOnLastLine } from "./chat/chatUtils";
+import ModelSelector from "./ModelSelector";
+
+// Built-in command definition (not user-configurable)
+interface BuiltInCommand {
+  id: string;
+  name: string;
+  description: string;
+  isBuiltIn: true;
+}
+
+interface InputAreaProps {
+  onSend: (content: string, attachments?: Attachment[], skillPath?: string) => void | Promise<void>;
+  onStop?: () => void;
+  isLoading: boolean;
+  model: ModelType;
+  onModelChange: (model: ModelType) => void;
+  availableModels: ModelInfo[];
+  codexModels: CodexModelOption[];
+  codexModel?: string;
+  codexReasoningEffort: CodexReasoningEffort;
+  onCodexConfigChange: (model: string | undefined, reasoningEffort: CodexReasoningEffort) => void;
+  allowWebSearch: boolean;
+  webSearchEnabled: boolean;
+  ragEnabled: boolean;
+  ragSettings: string[];
+  selectedRagSetting: string | null;
+  onSearchSelectionChange: (selection: SearchSelection) => void;
+  vaultToolMode: VaultToolMode;
+  onVaultToolModeChange: (mode: VaultToolMode) => void;
+  vaultToolModeOnlyNone: boolean; // When true, only "none" option is available
+  maxPreviousMessages: number;
+  onMaxPreviousMessagesChange: (count: number) => void;
+  inputHistory: string[];
+  onInputHistoryAdd: (prompt: string) => void;
+  alwaysThinkModels: Set<string>;
+  onAlwaysThinkModelToggle: (modelId: string, enabled: boolean) => void;
+  mcpServers: McpServerConfig[]; // MCP server configurations
+  onMcpServerToggle: (serverName: string, enabled: boolean) => void; // Per-server toggle handler
+  slashCommands: SlashCommand[];
+  onSlashCommand: (command: SlashCommand) => string;
+  availableSkills: SkillMetadata[];
+  activeSkillPaths: string[];
+  onToggleSkill: (folderPath: string) => void;
+  okfBundles: OkfBundle[];
+  activeOkfBundleIds: string[];
+  onToggleOkfBundle: (bundleId: string) => void;
+  onCompact?: () => void; // Built-in /compact command handler
+  messageCount?: number; // Number of messages (to enable/disable /compact)
+  isCompacting?: boolean; // Whether compact is in progress
+  vaultFiles: string[];
+  hasSelection: boolean;
+  app: App;
+}
+
+export interface InputAreaHandle {
+  setInputValue: (value: string) => void;
+  getInputValue: () => string;
+  focus: () => void;
+  addAttachments: (attachments: Attachment[]) => void;
+}
+
+// Mention candidates (special variables + vault files)
+interface MentionItem {
+  value: string;
+  description: string;
+  kind: "variable" | "mention" | "wikilink";
+}
+
+// 対応ファイル形式
+const SUPPORTED_TYPES = {
+  image: ["image/png", "image/jpeg", "image/gif", "image/webp"],
+  pdf: ["application/pdf"],
+  text: ["text/plain", "text/markdown", "text/csv", "application/json"],
+  audio: ["audio/mpeg", "audio/wav", "audio/flac", "audio/aac", "audio/mp4", "audio/opus", "audio/ogg"],
+  video: ["video/mp4", "video/webm", "video/quicktime", "video/x-msvideo", "video/x-matroska"],
+};
+
+const MAX_ATTACHMENT_SIZE = 20 * 1024 * 1024; // 20MB
+const HISTORY_LIMIT_OPTIONS = Array.from({ length: 100 }, (_, index) => index);
+
+const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
+  onSend,
+  onStop,
+  isLoading,
+  model,
+  onModelChange,
+  availableModels,
+  codexModels,
+  codexModel,
+  codexReasoningEffort,
+  onCodexConfigChange,
+  allowWebSearch,
+  webSearchEnabled,
+  ragEnabled,
+  ragSettings,
+  selectedRagSetting,
+  onSearchSelectionChange,
+  vaultToolMode,
+  onVaultToolModeChange,
+  vaultToolModeOnlyNone,
+  maxPreviousMessages,
+  onMaxPreviousMessagesChange,
+  inputHistory,
+  onInputHistoryAdd,
+  alwaysThinkModels,
+  onAlwaysThinkModelToggle,
+  mcpServers,
+  onMcpServerToggle,
+  slashCommands,
+  onSlashCommand,
+  availableSkills,
+  activeSkillPaths,
+  onToggleSkill,
+  okfBundles,
+  activeOkfBundleIds,
+  onToggleOkfBundle,
+  onCompact,
+  messageCount = 0,
+  isCompacting = false,
+  vaultFiles,
+  hasSelection,
+  app,
+}, ref) {
+  const [input, setInput] = useState("");
+  const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [showAutocomplete, setShowAutocomplete] = useState(false);
+  const [autocompleteIndex, setAutocompleteIndex] = useState(0);
+  const [filteredCommands, setFilteredCommands] = useState<(SlashCommand | BuiltInCommand)[]>([]);
+  // Mention autocomplete state
+  const [showMentionAutocomplete, setShowMentionAutocomplete] = useState(false);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [filteredMentions, setFilteredMentions] = useState<MentionItem[]>([]);
+  const [mentionStartPos, setMentionStartPos] = useState(0);
+  const [showVaultToolMenu, setShowVaultToolMenu] = useState(false);
+  const [showSearchMenu, setShowSearchMenu] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const mentionAutocompleteRef = useRef<HTMLDivElement>(null);
+  const vaultToolMenuRef = useRef<HTMLDivElement>(null);
+  const searchMenuRef = useRef<HTMLDivElement>(null);
+  const searchButtonRef = useRef<HTMLButtonElement>(null);
+  const historyIndexRef = useRef<number | null>(null);
+  const historyDraftRef = useRef("");
+
+  // Scroll to selected mention item
+  useEffect(() => {
+    if (showMentionAutocomplete && mentionAutocompleteRef.current) {
+      const container = mentionAutocompleteRef.current;
+      const activeItem = container.children[mentionIndex] as HTMLElement;
+      if (activeItem) {
+        activeItem.scrollIntoView({ block: "nearest" });
+      }
+    }
+  }, [mentionIndex, showMentionAutocomplete]);
+
+  // Close vault tool menu when clicking outside
+  useEffect(() => {
+    if (!showVaultToolMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (vaultToolMenuRef.current && !vaultToolMenuRef.current.contains(e.target as Node)) {
+        setShowVaultToolMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showVaultToolMenu]);
+
+  useEffect(() => {
+    if (!showSearchMenu) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (searchMenuRef.current && !searchMenuRef.current.contains(event.target as Node)) {
+        setShowSearchMenu(false);
+      }
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setShowSearchMenu(false);
+        searchButtonRef.current?.focus();
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleEscape);
+    window.setTimeout(() => searchMenuRef.current?.querySelector<HTMLInputElement>("input:not(:disabled)")?.focus(), 0);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [showSearchMenu]);
+
+  // Expose methods via ref
+  useImperativeHandle(ref, () => ({
+    setInputValue: (value: string) => setInput(value),
+    getInputValue: () => input,
+    focus: () => textareaRef.current?.focus(),
+    addAttachments: (attachments: Attachment[]) => setPendingAttachments(prev => [...prev, ...attachments]),
+  }));
+
+  // Auto-resize textarea based on content
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      // Use Obsidian's setCssProps for dynamic height adjustment
+      textarea.setCssProps({ height: "auto" });
+      const height = `${Math.min(textarea.scrollHeight, 200)}px`;
+      textarea.setCssProps({ height });
+    }
+  }, [input]);
+
+  // Build mention candidates
+  const buildMentionCandidates = (query: string): MentionItem[] => {
+    const hasActiveNote = !!app.workspace.getActiveFile();
+    const variables: MentionItem[] = [
+      // Only show {selection} if there's an active selection
+      ...(hasSelection ? [{ value: "{selection}", description: t("input.selectionVariable"), kind: "variable" as const }] : []),
+      // Only show {content} if there's an active note
+      ...(hasActiveNote ? [{ value: "{content}", description: t("input.contentVariable"), kind: "variable" as const }] : []),
+    ];
+    const files: MentionItem[] = vaultFiles.map((f) => ({
+      value: f,
+      description: t("input.vaultFile"),
+      kind: "mention",
+    }));
+    const all = [...variables, ...files];
+    if (!query) return all.slice(0, 10);
+    const lowerQuery = query.toLowerCase();
+    return all.filter((item) => item.value.toLowerCase().includes(lowerQuery)).slice(0, 10);
+  };
+
+  const buildWikilinkCandidates = (query: string): MentionItem[] => {
+    const lowerQuery = query.toLowerCase();
+    return vaultFiles
+      .filter((file) => !lowerQuery || file.toLowerCase().includes(lowerQuery))
+      .slice(0, 10)
+      .map((file) => ({
+        value: file,
+        description: t("input.vaultFile"),
+        kind: "wikilink" as const,
+      }));
+  };
+
+  const handleSubmit = () => {
+    if ((input.trim() || pendingAttachments.length > 0) && !isLoading) {
+      // Intercept /compact command
+      if (input.trim() === "/compact" && onCompact) {
+        if (messageCount >= 2) {
+          setInput("");
+          onCompact();
+        }
+        return;
+      }
+      // Intercept /skillFolder command — send with skill path as metadata
+      if (input.trim().startsWith("/")) {
+        const trimmed = input.trim();
+        for (const skill of availableSkills) {
+          const folderName = skill.folderPath.split("/").pop() || "";
+          const prefix = `/${folderName}`;
+          if (trimmed.toLowerCase().startsWith(prefix.toLowerCase()) &&
+              (trimmed.length === prefix.length || trimmed[prefix.length] === " ")) {
+            const userMessage = trimmed.slice(prefix.length).trim();
+            onInputHistoryAdd(input);
+            void onSend(userMessage, pendingAttachments.length > 0 ? pendingAttachments : undefined, skill.folderPath);
+            setInput("");
+            setPendingAttachments([]);
+            return;
+          }
+        }
+      }
+      if (input.trim()) onInputHistoryAdd(input);
+      void onSend(input, pendingAttachments.length > 0 ? pendingAttachments : undefined);
+      historyIndexRef.current = null;
+      historyDraftRef.current = "";
+      setInput("");
+      setPendingAttachments([]);
+    }
+  };
+
+  const handleInputChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+    const value = e.target.value;
+    const cursorPos = e.target.selectionStart;
+    setInput(value);
+    historyIndexRef.current = null;
+
+    // Check for slash command trigger (only at start of input)
+    if (value.startsWith("/")) {
+      const query = value.slice(1).toLowerCase();
+
+      // Build built-in commands list
+      const builtInCommands: BuiltInCommand[] = [];
+      if (onCompact && messageCount >= 2) {
+        builtInCommands.push({
+          id: "__compact__",
+          name: "compact",
+          description: t("command.compact"),
+          isBuiltIn: true,
+        });
+      }
+
+      // Add all skills as built-in commands (use folder name as command name)
+      for (const skill of availableSkills) {
+        const folderName = skill.folderPath.split("/").pop() || "";
+        builtInCommands.push({
+          id: `__skill__${skill.folderPath}`,
+          name: folderName,
+          description: `${skill.name}${skill.description ? ` - ${skill.description}` : ""}`,
+          isBuiltIn: true,
+        });
+      }
+
+      // Filter both user-defined and built-in commands
+      const userMatches = slashCommands.filter((cmd) =>
+        cmd.name.toLowerCase().startsWith(query)
+      );
+      const builtInMatches = builtInCommands.filter((cmd) =>
+        cmd.name.toLowerCase().startsWith(query)
+      );
+      const matches: (SlashCommand | BuiltInCommand)[] = [...userMatches, ...builtInMatches];
+      setFilteredCommands(matches);
+      setShowAutocomplete(matches.length > 0);
+      setAutocompleteIndex(0);
+      setShowMentionAutocomplete(false);
+      return;
+    } else {
+      setShowAutocomplete(false);
+    }
+
+    // Check for [[ wikilink trigger
+    const textBeforeCursor = value.substring(0, cursorPos);
+    const wikiMatch = textBeforeCursor.match(/\[\[([^\]\n]*)$/);
+    if (wikiMatch) {
+      const query = wikiMatch[1];
+      const startPos = cursorPos - wikiMatch[0].length;
+      const mentions = buildWikilinkCandidates(query);
+      setFilteredMentions(mentions);
+      setMentionStartPos(startPos);
+      setShowMentionAutocomplete(mentions.length > 0);
+      setMentionIndex(0);
+      return;
+    }
+
+    // Check for @ mention trigger
+    const atMatch = textBeforeCursor.match(/@([^\s@]*)$/);
+    if (atMatch) {
+      const query = atMatch[1];
+      const startPos = cursorPos - atMatch[0].length;
+      const mentions = buildMentionCandidates(query);
+      setFilteredMentions(mentions);
+      setMentionStartPos(startPos);
+      setShowMentionAutocomplete(mentions.length > 0);
+      setMentionIndex(0);
+    } else {
+      setShowMentionAutocomplete(false);
+    }
+  };
+
+  const selectCommand = (command: SlashCommand | BuiltInCommand) => {
+    setShowAutocomplete(false);
+    if ("isBuiltIn" in command && command.isBuiltIn) {
+      // Handle built-in commands
+      if (command.id === "__compact__" && onCompact) {
+        setInput("");
+        onCompact();
+      }
+      // Handle skill — send immediately with skill path
+      if (command.id.startsWith("__skill__")) {
+        const folderPath = command.id.slice("__skill__".length);
+        const userMessage = input.replace(/^\/\S*\s*/, "").trim();
+        onInputHistoryAdd(input);
+        void onSend(userMessage, pendingAttachments.length > 0 ? pendingAttachments : undefined, folderPath);
+        setInput("");
+        setPendingAttachments([]);
+      }
+      return;
+    }
+    const resolvedPrompt = onSlashCommand(command as SlashCommand);
+    setInput(resolvedPrompt);
+    textareaRef.current?.focus();
+  };
+
+  const selectMention = (mention: MentionItem) => {
+    // Replace @query with the selected mention value
+    const cursorPos = textareaRef.current?.selectionStart || input.length;
+    const before = input.substring(0, mentionStartPos);
+    const after = input.substring(cursorPos);
+    const inserted = mention.kind === "wikilink" ? `[[${mention.value}]]` : `${mention.value} `;
+    const newInput = before + inserted + after;
+    setInput(newInput);
+    setShowMentionAutocomplete(false);
+    // Set cursor position after the inserted mention
+    window.setTimeout(() => {
+      const newPos = mentionStartPos + inserted.length;
+      textareaRef.current?.setSelectionRange(newPos, newPos);
+      textareaRef.current?.focus();
+    }, 0);
+  };
+
+  const handleKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    // Slash command autocomplete
+    if (showAutocomplete) {
+      if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) {
+        e.preventDefault();
+        setAutocompleteIndex((prev) =>
+          Math.min(prev + 1, filteredCommands.length - 1)
+        );
+        return;
+      }
+      if (e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey)) {
+        e.preventDefault();
+        setAutocompleteIndex((prev) => Math.max(prev - 1, 0));
+        return;
+      }
+      if (e.key === "Enter" && !e.nativeEvent.isComposing && filteredCommands.length > 0) {
+        e.preventDefault();
+        selectCommand(filteredCommands[autocompleteIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        setShowAutocomplete(false);
+        return;
+      }
+    }
+
+    // Mention autocomplete
+    if (showMentionAutocomplete) {
+      if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) {
+        e.preventDefault();
+        setMentionIndex((prev) =>
+          Math.min(prev + 1, filteredMentions.length - 1)
+        );
+        return;
+      }
+      if (e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey)) {
+        e.preventDefault();
+        setMentionIndex((prev) => Math.max(prev - 1, 0));
+        return;
+      }
+      // Ctrl+Shift+O to preview (open) the selected file
+      if (e.key === "O" && e.ctrlKey && e.shiftKey && filteredMentions.length > 0) {
+        e.preventDefault();
+        const mention = filteredMentions[mentionIndex];
+        if (mention && mention.kind !== "variable") {
+          void app.workspace.openLinkText(mention.value, "", true);
+          // Return focus to textarea after opening
+          window.setTimeout(() => textareaRef.current?.focus(), 100);
+        }
+        return;
+      }
+      if (e.key === "Enter" && !e.nativeEvent.isComposing && filteredMentions.length > 0) {
+        e.preventDefault();
+        selectMention(filteredMentions[mentionIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        setShowMentionAutocomplete(false);
+        return;
+      }
+    }
+
+    // Recall sent prompts without taking arrow keys away from multiline editing.
+    // Up activates on the first line; Down activates on the last line.
+    if (!e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && inputHistory.length > 0
+      && e.currentTarget.selectionStart === e.currentTarget.selectionEnd) {
+      const caret = e.currentTarget.selectionStart;
+      if (e.key === "ArrowUp" && isCaretOnFirstLine(input, caret)) {
+        e.preventDefault();
+        const nextIndex = historyIndexRef.current === null
+          ? inputHistory.length - 1
+          : Math.max(0, historyIndexRef.current - 1);
+        if (historyIndexRef.current === null) historyDraftRef.current = input;
+        historyIndexRef.current = nextIndex;
+        setInput(inputHistory[nextIndex]);
+        return;
+      }
+      if (e.key === "ArrowDown" && historyIndexRef.current !== null && isCaretOnLastLine(input, caret)) {
+        e.preventDefault();
+        const nextIndex = historyIndexRef.current + 1;
+        if (nextIndex >= inputHistory.length) {
+          historyIndexRef.current = null;
+          setInput(historyDraftRef.current);
+        } else {
+          historyIndexRef.current = nextIndex;
+          setInput(inputHistory[nextIndex]);
+        }
+        return;
+      }
+    }
+
+    // IME変換中はEnterで送信しない
+    // モバイルではEnterで送信しない（Shift+Enterが難しいため）
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && !Platform.isMobile) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
+
+  const handleFileSelect = async (e: ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+
+    for (const file of Array.from(files)) {
+      const attachment = await processFile(file);
+      if (attachment) {
+        setPendingAttachments(prev => [...prev, attachment]);
+      }
+    }
+
+    // Reset input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  };
+
+  const processFile = async (file: File): Promise<Attachment | null> => {
+    const mimeType = file.type;
+
+    // ファイルサイズチェック（20MB制限）
+    if (file.size > MAX_ATTACHMENT_SIZE) {
+      new Notice(t("input.fileTooLarge", { name: file.name }));
+      return null;
+    }
+
+    // 画像
+    if (SUPPORTED_TYPES.image.includes(mimeType)) {
+      const data = await fileToBase64(file);
+      return { name: file.name, type: "image", mimeType, data };
+    }
+
+    // PDF
+    if (SUPPORTED_TYPES.pdf.includes(mimeType)) {
+      const data = await fileToBase64(file);
+      return { name: file.name, type: "pdf", mimeType, data };
+    }
+
+    // テキスト
+    if (SUPPORTED_TYPES.text.includes(mimeType) || file.name.endsWith(".md") || file.name.endsWith(".txt")) {
+      const data = await fileToBase64(file);
+      return { name: file.name, type: "text", mimeType: mimeType || "text/plain", data };
+    }
+
+    // 音声
+    if (SUPPORTED_TYPES.audio.includes(mimeType)) {
+      const data = await fileToBase64(file);
+      return { name: file.name, type: "audio", mimeType, data };
+    }
+
+    // 動画
+    if (SUPPORTED_TYPES.video.includes(mimeType)) {
+      const data = await fileToBase64(file);
+      return { name: file.name, type: "video", mimeType, data };
+    }
+
+    // Unsupported file type
+    return null;
+  };
+
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        // Remove data URL prefix (e.g., "data:image/png;base64,")
+        const base64 = result.split(",")[1];
+        resolve(base64);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const removeAttachment = (index: number) => {
+    setPendingAttachments(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const getAllAcceptedTypes = () => {
+    return [...SUPPORTED_TYPES.image, ...SUPPORTED_TYPES.pdf, ...SUPPORTED_TYPES.text, ...SUPPORTED_TYPES.audio, ...SUPPORTED_TYPES.video, ".md", ".txt"].join(",");
+  };
+
+  return (
+    <div className={`llm-hub-input-container ${isCollapsed ? "collapsed" : ""}`}>
+      {/* MCP servers enabled for this chat */}
+      {!isCollapsed && mcpServers.some((server) => server.enabled) && (
+        <div className="llm-hub-enabled-mcp-servers">
+          {mcpServers.filter((server) => server.enabled).map((server) => (
+            <span
+              key={server.name}
+              className="llm-hub-enabled-mcp-server"
+              title={t("input.mcpServerEnabled", { name: server.name })}
+            >
+              <Wrench size={12} aria-hidden="true" />
+              <span className="llm-hub-enabled-mcp-server-name">{server.name}</span>
+              <button
+                type="button"
+                className="llm-hub-enabled-mcp-server-remove"
+                onClick={() => onMcpServerToggle(server.name, false)}
+                disabled={isLoading || vaultToolModeOnlyNone}
+                title={t("input.mcpServerDisable", { name: server.name })}
+                aria-label={t("input.mcpServerDisable", { name: server.name })}
+              >
+                <X size={10} aria-hidden="true" />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Pending attachments display */}
+      {!isCollapsed && pendingAttachments.length > 0 && (
+        <div className="llm-hub-pending-attachments">
+          {pendingAttachments.map((attachment, index) => (
+            <span
+              key={index}
+              className={`llm-hub-pending-attachment${attachment.sourcePath ? " llm-hub-clickable" : ""}`}
+              onClick={() => {
+                if (!attachment.sourcePath) return;
+                new RagSourceModal(app, attachment, (result) => {
+                  setPendingAttachments(prev => {
+                    const next = [...prev];
+                    next[index] = result.attachment;
+                    return next;
+                  });
+                }).open();
+              }}
+              title={attachment.sourcePath ? t("ragSource.clickToView") : undefined}
+            >
+              {attachment.type === "image" && "🖼️"}
+              {attachment.type === "pdf" && "📄"}
+              {attachment.type === "text" && "📃"}
+              {attachment.type === "audio" && "🎵"}
+              {attachment.type === "video" && "🎬"}
+              {" "}{attachment.name}
+              <button
+                className="llm-hub-pending-attachment-remove"
+                onClick={(e) => { e.stopPropagation(); removeAttachment(index); }}
+                title={t("input.removeAttachment")}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {!isCollapsed && (
+        <div className="llm-hub-input-area">
+          {/* Slash command autocomplete */}
+          {showAutocomplete && (
+          <div className="llm-hub-autocomplete">
+            {filteredCommands.map((cmd, index) => (
+              <div
+                key={cmd.id}
+                className={`llm-hub-autocomplete-item ${
+                  index === autocompleteIndex ? "active" : ""
+                }`}
+                onClick={() => selectCommand(cmd)}
+                onMouseEnter={() => setAutocompleteIndex(index)}
+              >
+                <span className="llm-hub-autocomplete-name">
+                  {"id" in cmd && (cmd as BuiltInCommand).id?.startsWith("__skill__") ? `✨ /${cmd.name}` : `/${cmd.name}`}
+                </span>
+                {("description" in cmd) && cmd.description && (
+                  <span className="llm-hub-autocomplete-desc">
+                    {cmd.description}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Mention autocomplete */}
+        {showMentionAutocomplete && (
+          <div className="llm-hub-autocomplete" ref={mentionAutocompleteRef}>
+            {filteredMentions.map((mention, index) => (
+              <div
+                key={mention.value}
+                className={`llm-hub-autocomplete-item ${
+                  index === mentionIndex ? "active" : ""
+                }`}
+                onClick={() => selectMention(mention)}
+                onMouseEnter={() => setMentionIndex(index)}
+              >
+                <span className="llm-hub-autocomplete-name">
+                  {mention.kind === "wikilink" ? `[[${mention.value}]]` : mention.value}
+                </span>
+                <span className="llm-hub-autocomplete-desc">
+                  {mention.description}
+                </span>
+                {mention.kind !== "variable" && (
+                  <button
+                    className="llm-hub-preview-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void app.workspace.openLinkText(mention.value, "", true);
+                      window.setTimeout(() => textareaRef.current?.focus(), 100);
+                    }}
+                    title={t("input.openFile")}
+                  >
+                    <Eye size={12} />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Hidden file input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept={getAllAcceptedTypes()}
+          onChange={(event) => {
+            void handleFileSelect(event);
+          }}
+          className="llm-hub-hidden-input"
+        />
+
+        {/* Left button column */}
+        <div className="llm-hub-input-buttons">
+          {/* Attachment button */}
+          <button
+            className="llm-hub-attachment-btn"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isLoading}
+            title={t("input.attach")}
+          >
+            <Paperclip size={18} />
+          </button>
+
+          {/* Vault tool mode button */}
+          <div className="llm-hub-vault-tool-container" ref={vaultToolMenuRef}>
+            <button
+              className={`llm-hub-vault-tool-btn ${vaultToolMode !== "all" ? "active" : ""}`}
+              onClick={() => setShowVaultToolMenu(!showVaultToolMenu)}
+              disabled={isLoading || isImageGenerationModel(model)}
+              title={t("input.vaultToolTitle")}
+            >
+              <Database size={18} />
+            </button>
+            {showVaultToolMenu && mcpServers.length === 0 && (
+              <div className="llm-hub-vault-tool-menu">
+                <div
+                  className={`llm-hub-vault-tool-item ${vaultToolMode === "all" ? "selected" : ""} ${vaultToolModeOnlyNone ? "disabled" : ""}`}
+                  onClick={() => { if (!vaultToolModeOnlyNone) { onVaultToolModeChange("all"); setShowVaultToolMenu(false); } }}
+                >
+                  <div>{t("input.vaultToolAll")}</div>
+                  <div className="llm-hub-vault-tool-item-desc">{t("input.vaultToolAllDesc")}</div>
+                </div>
+                <div
+                  className={`llm-hub-vault-tool-item ${vaultToolMode === "noSearch" ? "selected" : ""} ${vaultToolModeOnlyNone ? "disabled" : ""}`}
+                  onClick={() => { if (!vaultToolModeOnlyNone) { onVaultToolModeChange("noSearch"); setShowVaultToolMenu(false); } }}
+                >
+                  <div>{t("input.vaultToolNoSearch")}</div>
+                  <div className="llm-hub-vault-tool-item-desc">{t("input.vaultToolNoSearchDesc")}</div>
+                </div>
+                <div
+                  className={`llm-hub-vault-tool-item ${vaultToolMode === "none" ? "selected" : ""}`}
+                  onClick={() => { onVaultToolModeChange("none"); setShowVaultToolMenu(false); }}
+                >
+                  <div>{t("input.vaultToolNone")}</div>
+                  <div className="llm-hub-vault-tool-item-desc">{t("input.vaultToolNoneDesc")}</div>
+                </div>
+                <div className="llm-hub-vault-tool-separator" />
+                <label className="llm-hub-vault-tool-checkbox">
+                  <span>{t("input.historyLimit")}</span>
+                  <select value={maxPreviousMessages}
+                    onChange={(e) => onMaxPreviousMessagesChange(Number(e.target.value))}>
+                    {HISTORY_LIMIT_OPTIONS.map(count => <option key={count} value={count}>{count}</option>)}
+                  </select>
+                </label>
+                <div className="llm-hub-vault-tool-separator" />
+                <div className="llm-hub-vault-tool-section-label">{t("input.thinkingLabel")}</div>
+                {(() => {
+                  const apiModels = availableModels.filter(m => !m.isCliModel);
+                  const groups = new Map<string, typeof apiModels>();
+                  for (const m of apiModels) {
+                    const group = m.providerName || "Other";
+                    if (!groups.has(group)) groups.set(group, []);
+                    groups.get(group)!.push(m);
+                  }
+                  return Array.from(groups.entries()).map(([groupName, models]) => (
+                    <details key={groupName} className="llm-hub-think-group">
+                      <summary className="llm-hub-think-group-summary">{groupName}</summary>
+                      {models.map(m => {
+                        const required = isThinkingRequired(m.name);
+                        return (
+                          <label key={m.name} className="llm-hub-vault-tool-checkbox">
+                            <input type="checkbox" checked={required || alwaysThinkModels.has(m.name)} onChange={(e) => onAlwaysThinkModelToggle(m.name, e.target.checked)} disabled={required} />
+                            <span>{m.displayName}</span>
+                          </label>
+                        );
+                      })}
+                    </details>
+                  ));
+                })()}
+              </div>
+            )}
+            {/* Modal for vault tool + MCP settings when MCP servers are configured */}
+            {showVaultToolMenu && mcpServers.length > 0 && (
+              <div className="llm-hub-tool-settings-modal">
+                <div className="llm-hub-tool-settings-content">
+                  <div className="llm-hub-tool-settings-row">
+                    <label>{t("input.vaultToolLabel")}</label>
+                    <select
+                      value={vaultToolMode}
+                      onChange={(e) => onVaultToolModeChange(e.target.value as VaultToolMode)}
+                      disabled={vaultToolModeOnlyNone}
+                    >
+                      <option value="all" disabled={vaultToolModeOnlyNone}>{t("input.vaultToolAll")}</option>
+                      <option value="noSearch" disabled={vaultToolModeOnlyNone}>{t("input.vaultToolNoSearch")}</option>
+                      <option value="none">{t("input.vaultToolNone")}</option>
+                    </select>
+                  </div>
+                  <div className="llm-hub-tool-settings-row">
+                    <label>{t("input.historyLimit")}</label>
+                    <select value={maxPreviousMessages}
+                      onChange={(e) => onMaxPreviousMessagesChange(Number(e.target.value))}>
+                      {HISTORY_LIMIT_OPTIONS.map(count => <option key={count} value={count}>{count}</option>)}
+                    </select>
+                  </div>
+                  <div className="llm-hub-tool-settings-row">
+                    <label>{t("input.mcpServersLabel")}</label>
+                    <div className="llm-hub-mcp-server-list">
+                      {mcpServers.map((server) => {
+                        const toolCount = server.toolHints?.length || 0;
+                        const toolHint = toolCount > 0
+                          ? t("input.mcpToolHint", { count: String(toolCount), tools: server.toolHints?.slice(0, 3).join(", ") + (toolCount > 3 ? ", ..." : "") })
+                          : "";
+                        return (
+                          <label
+                            key={server.name}
+                            className={`llm-hub-mcp-server-item${vaultToolModeOnlyNone ? " is-disabled" : ""}`}
+                            title={server.toolHints?.join(", ") || ""}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={!vaultToolModeOnlyNone && server.enabled}
+                              onChange={(e) => onMcpServerToggle(server.name, e.target.checked)}
+                              disabled={vaultToolModeOnlyNone}
+                            />
+                            <span className="llm-hub-mcp-server-name">{server.name}</span>
+                            {toolHint && <span className="llm-hub-mcp-tool-hint">{toolHint}</span>}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="llm-hub-tool-settings-row">
+                    <label>{t("input.thinkingLabel")}</label>
+                    <div className="llm-hub-mcp-server-list">
+                      {(() => {
+                        const apiModels = availableModels.filter(m => !m.isCliModel);
+                        const groups = new Map<string, typeof apiModels>();
+                        for (const m of apiModels) {
+                          const group = m.providerName || "Other";
+                          if (!groups.has(group)) groups.set(group, []);
+                          groups.get(group)!.push(m);
+                        }
+                        return Array.from(groups.entries()).map(([groupName, models]) => (
+                          <details key={groupName} className="llm-hub-think-group">
+                            <summary className="llm-hub-think-group-summary">{groupName}</summary>
+                            {models.map(m => {
+                              const required = isThinkingRequired(m.name);
+                              return (
+                                <label key={m.name} className={`llm-hub-mcp-server-item${required ? " is-disabled" : ""}`}>
+                                  <input type="checkbox" checked={required || alwaysThinkModels.has(m.name)} onChange={(e) => onAlwaysThinkModelToggle(m.name, e.target.checked)} disabled={required} />
+                                  <span className="llm-hub-mcp-server-name">{m.displayName}</span>
+                                </label>
+                              );
+                            })}
+                          </details>
+                        ));
+                      })()}
+                    </div>
+                  </div>
+                  <button
+                    className="llm-hub-tool-settings-close"
+                    onClick={() => setShowVaultToolMenu(false)}
+                  >
+                    {t("input.close")}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <textarea
+          ref={textareaRef}
+          className="llm-hub-input"
+          value={input}
+          onChange={handleInputChange}
+          onKeyDown={handleKeyDown}
+          placeholder={isCompacting ? t("chat.compacting") : (Platform.isMobile ? t("input.placeholderMobile") : t("input.placeholder"))}
+          disabled={isCompacting}
+          rows={3}
+        />
+        <div className="llm-hub-send-buttons">
+          {isCompacting ? (
+            <button
+              className="llm-hub-send-btn"
+              disabled={true}
+              title={t("chat.compacting")}
+            >
+              <Loader2 size={18} className="llm-hub-spinner" />
+            </button>
+          ) : isLoading ? (
+            <button
+              className="llm-hub-stop-btn"
+              onClick={onStop}
+              title={t("input.stop")}
+            >
+              <StopCircle size={18} />
+            </button>
+          ) : (
+            <button
+              className="llm-hub-send-btn"
+              onClick={handleSubmit}
+              disabled={!input.trim() && pendingAttachments.length === 0}
+              title={t("input.send")}
+            >
+              <Send size={18} />
+            </button>
+          )}
+          {Platform.isMobile && (
+            <button
+              className="llm-hub-collapse-btn"
+              onClick={() => setIsCollapsed(!isCollapsed)}
+              title={isCollapsed ? t("input.expand") : t("input.collapse")}
+            >
+              {isCollapsed ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+            </button>
+          )}
+        </div>
+      </div>
+      )}
+
+      {/* Collapsed state: show only expand button */}
+      {isCollapsed && Platform.isMobile && (
+        <div className="llm-hub-collapsed-bar">
+          <button
+            className="llm-hub-expand-btn"
+            onClick={() => setIsCollapsed(false)}
+            title={t("input.expand")}
+          >
+            <ChevronUp size={18} />
+          </button>
+        </div>
+      )}
+
+      {!isCollapsed && (
+        <div className="llm-hub-model-selector">
+          <ModelSelector
+            models={availableModels}
+            value={model}
+            onChange={onModelChange}
+            disabled={isLoading}
+          />
+          {model === "codex-cli" && (
+            <>
+              <select
+                className="llm-hub-model-select"
+                value={codexModel || ""}
+                onChange={(e) => onCodexConfigChange(e.target.value || undefined, codexReasoningEffort)}
+                disabled={isLoading}
+                title={t("settings.codexCliModel")}
+              >
+                <option value="">{t("settings.codexCliModel.default")}</option>
+                {codexModels.map((option) => (
+                  <option key={option.slug} value={option.slug}>
+                    {option.displayName} ({option.slug})
+                  </option>
+                ))}
+                {codexModel && !codexModels.some((option) => option.slug === codexModel) && (
+                  <option value={codexModel}>{codexModel}</option>
+                )}
+              </select>
+              <select
+                className="llm-hub-model-select"
+                value={codexReasoningEffort}
+                onChange={(e) => onCodexConfigChange(codexModel, e.target.value as CodexReasoningEffort)}
+                disabled={isLoading}
+                title={t("settings.codexCliReasoningEffort")}
+              >
+                {(["minimal", "low", "medium", "high", "xhigh"] as CodexReasoningEffort[]).map((effort) => (
+                  <option key={effort} value={effort}>{effort}</option>
+                ))}
+              </select>
+            </>
+          )}
+          <div className="llm-hub-search-selector" ref={searchMenuRef}>
+            <button
+              ref={searchButtonRef}
+              type="button"
+              className="llm-hub-model-select llm-hub-rag-select llm-hub-search-selector-button"
+              onClick={() => setShowSearchMenu(open => !open)}
+              disabled={isLoading}
+              aria-haspopup="menu"
+              aria-expanded={showSearchMenu}
+            >
+              {webSearchEnabled && selectedRagSetting
+                ? `${t("input.webSearch")} + ${selectedRagSetting}`
+                : webSearchEnabled
+                  ? t("input.webSearch")
+                  : selectedRagSetting
+                    ? t("input.rag", { name: selectedRagSetting })
+                    : t("input.searchNone")}
+              <ChevronDown size={13} aria-hidden="true" />
+            </button>
+            {showSearchMenu && (
+              <div className="llm-hub-search-selector-menu" role="menu">
+                <label className={`llm-hub-search-selector-option ${!allowWebSearch ? "disabled" : ""}`}>
+                  <input
+                    type="checkbox"
+                    checked={webSearchEnabled}
+                    disabled={!allowWebSearch}
+                    onChange={(event) => onSearchSelectionChange({
+                      webSearch: event.target.checked,
+                      ragSetting: selectedRagSetting,
+                    })}
+                  />
+                  <span>{t("input.webSearch")}</span>
+                </label>
+                <div className="llm-hub-search-selector-separator" />
+                <label className={`llm-hub-search-selector-option ${!ragEnabled || isImageGenerationModel(model) ? "disabled" : ""}`}>
+                  <input
+                    type="radio"
+                    name="llm-hub-rag-setting"
+                    checked={selectedRagSetting === null}
+                    disabled={!ragEnabled || isImageGenerationModel(model)}
+                    onChange={() => onSearchSelectionChange({ webSearch: webSearchEnabled, ragSetting: null })}
+                  />
+                  <span>{t("input.rag", { name: t("common.none") })}</span>
+                </label>
+                {ragSettings.map((name) => (
+                  <label key={name} className={`llm-hub-search-selector-option ${!ragEnabled || isImageGenerationModel(model) ? "disabled" : ""}`}>
+                    <input
+                      type="radio"
+                      name="llm-hub-rag-setting"
+                      checked={selectedRagSetting === name}
+                      disabled={!ragEnabled || isImageGenerationModel(model)}
+                      onChange={() => onSearchSelectionChange({ webSearch: webSearchEnabled, ragSetting: name })}
+                    />
+                    <span>{t("input.rag", { name })}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      {!isCollapsed && availableSkills.length > 0 && (
+        <SkillSelector
+          skills={availableSkills}
+          activeSkillPaths={activeSkillPaths}
+          onToggleSkill={onToggleSkill}
+          disabled={isLoading}
+          app={app}
+        />
+      )}
+      {!isCollapsed && okfBundles.length > 0 && (
+        <OkfSelector
+          bundles={okfBundles}
+          activeBundleIds={activeOkfBundleIds}
+          onToggleBundle={onToggleOkfBundle}
+          disabled={isLoading}
+        />
+      )}
+    </div>
+  );
+});
+
+export default InputArea;
