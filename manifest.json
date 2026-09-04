@@ -2,7 +2,7 @@
   "id": "xdf-aichatbot",
   "name": "XDF AI Chat",
   "minAppVersion": "1.13.0",
-  "description": "新东方教学档案 Agent 壳。基于 LLM Hub 魔改：对话走 NewAPI，自动连接同库 xdf-toolkits 的 HTTP MCP。",
+  "description": "XDF AI 对话助手：基于 LLM 的教学档案 Agent，自动连接 xdf-toolkits MCP 服务",
   "author": "Schleiden",
   "authorUrl": "https://github.com/SchleidenLee",
   "isDesktopOnly": true,
