@@ -7,7 +7,7 @@
     "generate:builtin-okf": "node scripts/generate-builtin-okf.mjs",
     "dev": "npm run generate:builtin-okf && node esbuild.config.mjs",
     "dev:langfuse": "npm run generate:builtin-okf && node esbuild.config.mjs langfuse",
-    "build": "npm run generate:builtin-okf && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "build": "npm run generate:builtin-okf && node esbuild.config.mjs production",
     "build:langfuse": "npm run generate:builtin-okf && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production langfuse",
     "test": "vitest run",
     "lint": "eslint .",
