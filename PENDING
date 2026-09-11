@@ -1,0 +1,72 @@
+# PENDING - 系统提示词重构
+
+## 背景
+当前 Chatbot 的系统提示词存在严重幻觉问题：
+- "Be helpful" 开头鼓励模型直接给答案
+- XDF 规则作为 "Additional instructions" 追加，被模型视为可选建议
+- 全是"不要 X"的否定式指令，中等模型遵从度差
+- 没有定义"什么算完成"
+
+参考 QwenPaw 的分层提示词架构：硬编码执行契约（不可改）+ 用户 AGENTS.md（可配置）
+
+## 改动计划
+
+### 1. 新建 `src/core/systemPrompt.ts`
+- 定义 `PROTECTED_CONTRACT` 常量（硬编码执行契约）
+- 导出 `buildSystemPrompt()` 函数，统一拼装逻辑
+- 函数签名：`buildSystemPrompt(settings, context) => string`
+- 拼装顺序：
+  1. PROTECTED_CONTRACT（硬编码，最前面）
+  2. settings.systemPrompt（用户自定义，XDF 教学助手规则）
+  3. 运行时上下文（FILE_MENTION、OKF、RAG、Skills 等）
+
+### 2. 修改 `src/types/index.ts` 第 957 行
+- 将 `systemPrompt` 默认值改为 XDF 教学助手的正向执行契约
+- 去掉否定式"防幻觉"规则，改为正向指令
+
+### 3. 修改 `src/ui/components/Chat.tsx`
+- 4 条路径（CLI/LocalLLM/APIProvider/Gemini）统一调用 `buildSystemPrompt()`
+- 各路径只负责把返回的字符串塞进自己 SDK 的对应字段
+
+### 4. 执行契约内容（PROTECTED_CONTRACT）
+```
+## 工具调用规则
+你有可用的工具。需要查询、创建、修改数据时，必须在同一轮响应中调用工具。
+用工具返回的真实数据回答，不用自己的记忆。
+
+## 完成标准
+回答必须有真实工具输出支撑。计划、承诺、下一步列表不算完成。
+工具失败时，直接报告失败。诚实报告失败优于编造成功。
+绝不编造工具返回的数据。
+
+## 工具调用纪律
+说要查询/创建/修改某物时，必须在同一轮响应中调用工具。
+不要以"接下来我会..."结束而不调用工具。
+每次需要数据时调用工具获取，不依赖对话记忆中的旧数据。
+```
+
+### 5. 用户提示词默认值（settings.systemPrompt）
+```
+你是新东方雅思教学助手，当前库是固定结构的课程档案。
+
+## 数据来源限制
+班级名、学员名、课次号、日期、出勤、作业、分数只能来自 xdf-toolkits 工具返回的 JSON。
+工具没返回的数据视为不存在。
+
+不要用 search_notes 或聊天记录代替档案查询。
+
+## 写入规则
+写反馈、勾选、建档只用 MCP 的 write_* / create_*。
+不要破坏 <!-- AI_GENERATED_START/END --> 标记。
+
+结班测 OCR 不在本插件。
+```
+
+## 关键文件
+- `src/core/systemPrompt.ts` - 新建
+- `src/types/index.ts` - 修改 systemPrompt 默认值
+- `src/ui/components/Chat.tsx` - 4 条路径统一调用 buildSystemPrompt()
+
+## 参考
+- `references/QwenPaw/src/qwenpaw/runtime/protected_prompt.py` - QwenPaw 执行契约
+- `HARNESS-COMPARISON.md` - 详细对比分析

@@ -1,0 +1,114 @@
+/**
+ * 系统提示词构建模块
+ * 
+ * 参考 QwenPaw 的分层架构：
+ * 1. 硬编码执行契约（PROTECTED_CONTRACT）- 不可被用户修改
+ * 2. 用户自定义提示词（settings.systemPrompt）- XDF 教学助手规则
+ * 3. 运行时上下文（FILE_MENTION、OKF、RAG、Skills 等）
+ */
+
+/**
+ * 硬编码执行契约 - 永远在系统提示词最前面，不可被用户覆盖
+ * 
+ * 这是防止模型幻觉的核心机制：
+ * - 正向指令告诉模型"必须做什么"，而非"不要做什么"
+ * - 明确定义"完成标准"，防止模型以承诺代替行动
+ * - 要求工具调用必须在同一轮响应中执行
+ */
+export const PROTECTED_CONTRACT = `## 工具调用规则
+
+你有可用的工具。需要查询、创建、修改数据时，必须在同一轮响应中调用工具。
+用工具返回的真实数据回答，不用自己的记忆。
+
+## 完成标准
+
+回答必须有真实工具输出支撑。计划、承诺、下一步列表不算完成。
+
+工具失败时，直接报告失败。诚实报告失败优于编造成功。
+绝不编造工具返回的数据。
+
+## 工具调用纪律
+
+说要查询/创建/修改某物时，必须在同一轮响应中调用工具。
+不要以"接下来我会..."结束而不调用工具。
+每次需要数据时调用工具获取，不依赖对话记忆中的旧数据。`;
+
+/**
+ * 运行时上下文参数
+ */
+export interface SystemPromptContext {
+	/** 是否启用 Vault 工具（非 "none" 时注入 FILE_MENTION_TOOL_PROMPT） */
+	vaultToolMode: string;
+	/** 路径特有上下文（CLI 模式说明、Local LLM 工具说明等） */
+	pathContext?: string;
+	/** OKF 知识库上下文 */
+	okfContext?: string;
+	/** RAG 搜索上下文 */
+	ragContext?: string;
+	/** Skills 技能提示 */
+	skillsContext?: string;
+	/** NoDiscovery 提示（vaultToolMode 为 "noSearch" 时） */
+	noDiscoveryContext?: string;
+	/** RAG 搜索工具提示 */
+	ragSearchContext?: string;
+}
+
+/**
+ * Vault 文件提及工具提示
+ * 当用户通过 @ 提及文件时，告诉模型需要先读取文件内容
+ */
+export const FILE_MENTION_TOOL_PROMPT = `\n\nA bare vault-relative path in the user's message (for example \`folder/note.md\` or \`folder/document.pdf\`) is a file the user referenced by mention, not a literal string. Its content is not inlined into the message. Call read_note with that exact path before answering anything that depends on it.`;
+
+/**
+ * 构建完整的系统提示词
+ * 
+ * @param userPrompt - 用户自定义提示词（settings.systemPrompt）
+ * @param context - 运行时上下文
+ * @returns 完整的系统提示词字符串
+ */
+export function buildSystemPrompt(
+	userPrompt: string,
+	context: SystemPromptContext
+): string {
+	const parts: string[] = [];
+
+	// 第 1 层：硬编码执行契约（永远在最前面）
+	parts.push(PROTECTED_CONTRACT);
+
+	// 第 2 层：路径特有上下文（CLI 模式说明、Local LLM 工具说明等）
+	if (context.pathContext?.trim()) {
+		parts.push(context.pathContext.trim());
+	}
+
+	// 第 3 层：用户自定义提示词
+	if (userPrompt?.trim()) {
+		parts.push(userPrompt.trim());
+	}
+
+	// 第 3 层：运行时上下文
+	if (context.vaultToolMode !== "none") {
+		parts.push(FILE_MENTION_TOOL_PROMPT.trim());
+	}
+
+	if (context.okfContext) {
+		parts.push(context.okfContext.trim());
+	}
+
+	if (context.ragContext) {
+		parts.push(context.ragContext.trim());
+	}
+
+	if (context.skillsContext) {
+		parts.push(context.skillsContext.trim());
+	}
+
+	if (context.noDiscoveryContext) {
+		parts.push(context.noDiscoveryContext.trim());
+	}
+
+	if (context.ragSearchContext) {
+		parts.push(context.ragSearchContext.trim());
+	}
+
+	return parts.join("\n\n");
+}

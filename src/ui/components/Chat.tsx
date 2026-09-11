@@ -69,6 +69,7 @@ import { resolveApiProviderPdfInputMode, resolveLocalLlmPdfInputMode } from "src
 import { createRagSearchRunner, RAG_SEARCH_SYSTEM_PROMPT, RAG_SEARCH_TOOL, RAG_SEARCH_TOOL_NAME, type RagSearchRunner } from "src/core/ragSearchTool";
 import { filterVaultToolsForMode } from "src/core/vaultToolMode";
 import { buildNoDiscoverySystemPrompt } from "./chat/noDiscoveryPrompt";
+import { buildSystemPrompt } from "src/core/systemPrompt";
 import { createToolExecutor } from "src/vault/toolExecutor";
 import { extractPdfText } from "src/vault/search";
 import {
@@ -3003,22 +3004,23 @@ const Chat = forwardRef<ChatRef, ChatProps>(({ plugin, onToggleSidebarWidth }, r
 
 		try {
 			const settings = plugin.settings;
-			let systemPrompt = `You are a helpful AI assistant in an Obsidian vault.
-Always be helpful and provide clear, concise responses. When working with notes, confirm actions and provide relevant feedback.`;
 
-			if (vaultToolMode !== "none") {
-				systemPrompt += FILE_MENTION_TOOL_PROMPT;
-			}
-
-			if (settings.systemPrompt) {
-				systemPrompt += `\n\nAdditional instructions: ${settings.systemPrompt}`;
-			}
-
-			systemPrompt = await appendOkfSystemPrompt(systemPrompt);
-
-			// Local RAG: search and inject context into system prompt
+			// Collect runtime contexts for buildSystemPrompt
+			let okfContext = "";
+			let ragContext = "";
+			let skillsContext = "";
+			let noDiscoveryContext = "";
+			let ragSearchContext = "";
 			let localRagSources: string[] = [];
 			let ragSearchRunner: RagSearchRunner | null = null;
+
+			// OKF context
+			const systemPromptWithOkf = await appendOkfSystemPrompt(settings.systemPrompt || "");
+			if (systemPromptWithOkf !== (settings.systemPrompt || "")) {
+				okfContext = systemPromptWithOkf;
+			}
+
+			// Local RAG: search and collect context
 			const ragSettingObj = selectedRagSetting && !isImageGenerationModel(currentModel) ? plugin.getRagSearchSetting(selectedRagSetting) : null;
 			if (selectedRagSetting && ragSettingObj) {
 				ragSearchRunner = createRagSearchRunner(
@@ -3034,20 +3036,16 @@ Always be helpful and provide clear, concise responses. When working with notes,
 						ragSettingObj, getGeminiApiKey(plugin.settings),
 						plugin.settings.proxyUrl, plugin.settings.proxyBypass
 					);
-					// A search that threw never reached the index, so it must not consume
-					// the turn budget the model is told it has.
 					if (localRag.sources.length > 0) {
-						systemPrompt += localRag.context;
+						ragContext = localRag.context;
 						localRagSources = localRag.sources;
 						// Attach multimodal RAG files so the LLM can see actual content
 						if (localRag.mediaReferences.length > 0) {
 							const pdfMode = resolveApiProviderPdfInputMode(providerConfig);
 							const ragAttachments = (await loadRagMediaAttachments(plugin.app, localRag.mediaReferences))
 								.filter(attachment => attachment.type !== "pdf" || pdfMode === "native");
-							// A dropped PDF leaves only its label in the indexed chunk text,
-							// so its pages go into the prompt as extracted text instead.
 							if (pdfMode !== "native") {
-								systemPrompt += await buildRagPdfTextContext(plugin.app, localRag.mediaReferences);
+								ragContext += await buildRagPdfTextContext(plugin.app, localRag.mediaReferences);
 							}
 							if (ragAttachments.length > 0) {
 								const existing = userMessage.attachments || [];
@@ -3059,8 +3057,9 @@ Always be helpful and provide clear, concise responses. When working with notes,
 					console.error("Local RAG search failed:", formatError(e));
 				}
 			}
+
 			if (vaultToolMode === "noSearch") {
-				systemPrompt += buildNoDiscoverySystemPrompt({
+				noDiscoveryContext = buildNoDiscoverySystemPrompt({
 					ragRequested: Boolean(ragSearchRunner),
 					hasRagContext: localRagSources.length > 0,
 				});
@@ -3110,7 +3109,7 @@ Always be helpful and provide clear, concise responses. When working with notes,
 				}
 			}
 			if (apiLoadedSkills.length > 0) {
-				systemPrompt += buildSkillSystemPrompt(apiLoadedSkills);
+				skillsContext = buildSkillSystemPrompt(apiLoadedSkills) || "";
 			}
 			if (apiLoadedSkills.some(s => s.workflows.length > 0)) {
 				tools.push(skillWorkflowTool);
@@ -3122,8 +3121,18 @@ Always be helpful and provide clear, concise responses. When working with notes,
 			// Let the model search the selected index on demand.
 			if (ragSearchRunner) {
 				tools.push(RAG_SEARCH_TOOL);
-				systemPrompt += RAG_SEARCH_SYSTEM_PROMPT;
+				ragSearchContext = RAG_SEARCH_SYSTEM_PROMPT;
 			}
+
+			// Build system prompt using unified function
+			const systemPrompt = buildSystemPrompt(settings.systemPrompt, {
+				vaultToolMode,
+				okfContext,
+				ragContext,
+				skillsContext,
+				noDiscoveryContext,
+				ragSearchContext,
+			});
 
 			const apiSkillWorkflowMap = collectSkillWorkflows(apiLoadedSkills);
 			const apiSkillScriptMap = collectSkillScripts(apiLoadedSkills);
@@ -3893,13 +3902,19 @@ Always be helpful and provide clear, concise responses. When working with notes,
 					&& (toolsEnabled || isImageGenerationModel(allowedModel));
 				const isImageGeneration = isImageGenerationModel(allowedModel);
 
-				let systemPrompt = "You are a helpful AI assistant integrated with Obsidian.";
+				// Collect runtime contexts for buildSystemPrompt
+				let pathContext = "";
+				let okfContext = "";
+				let ragContext = "";
+				let skillsContext = "";
+				let noDiscoveryContext = "";
+				let ragSearchContext = "";
+				let localRagSources: string[] = [];
+				let ragSearchRunner: RagSearchRunner | null = null;
 
+				// Path-specific context for Gemini
 				if (toolsEnabled) {
-					systemPrompt += FILE_MENTION_TOOL_PROMPT;
-					systemPrompt += `
-
-Available tools allow you to:
+					pathContext = `Available tools allow you to:
 - Read notes from the vault
 - Create new notes
 - Update existing notes
@@ -3908,30 +3923,23 @@ Available tools allow you to:
 - Get information about the active note`;
 				}
 
-
-				systemPrompt += `
-
-Always be helpful and provide clear, concise responses. When working with notes, confirm actions and provide relevant feedback.`;
-
-				if (settings.systemPrompt) {
-					systemPrompt += `\n\nAdditional instructions: ${settings.systemPrompt}`;
-				}
-
-				// Inject active agent skills into system prompt
+				// Skills context
 				let skillsUsedNames: string[] = [];
 				if (loadedSkillsList.length > 0) {
 					const skillPrompt = buildSkillSystemPrompt(loadedSkillsList);
 					if (skillPrompt) {
-						systemPrompt += skillPrompt;
+						skillsContext = skillPrompt;
 						skillsUsedNames = loadedSkillsList.map(s => s.name);
 					}
 				}
 
-				systemPrompt = await appendOkfSystemPrompt(systemPrompt);
+				// OKF context
+				const systemPromptWithOkf = await appendOkfSystemPrompt(settings.systemPrompt || "");
+				if (systemPromptWithOkf !== (settings.systemPrompt || "")) {
+					okfContext = systemPromptWithOkf;
+				}
 
-				// Local RAG: search and inject context into system prompt
-				let localRagSources: string[] = [];
-				let ragSearchRunner: RagSearchRunner | null = null;
+				// Local RAG: search and collect context
 				const ragSettingObj = selectedRagSetting && !isImageGenerationModel(allowedModel) ? plugin.getRagSearchSetting(selectedRagSetting) : null;
 				if (selectedRagSetting && ragSettingObj) {
 					ragSearchRunner = createRagSearchRunner(
@@ -3947,20 +3955,15 @@ Always be helpful and provide clear, concise responses. When working with notes,
 							ragSettingObj, getGeminiApiKey(plugin.settings),
 							plugin.settings.proxyUrl, plugin.settings.proxyBypass
 						);
-						// A search that threw never reached the index, so it must not consume
-						// the turn budget the model is told it has.
 						if (localRag.sources.length > 0) {
-							systemPrompt += localRag.context;
+							ragContext = localRag.context;
 							localRagSources = localRag.sources;
-							// Attach multimodal RAG files so the LLM can see actual content
 							if (localRag.mediaReferences.length > 0) {
 								const pdfMode = providerConfig ? resolveApiProviderPdfInputMode(providerConfig) : "native";
 								const ragAttachments = (await loadRagMediaAttachments(plugin.app, localRag.mediaReferences))
 									.filter(attachment => attachment.type !== "pdf" || pdfMode === "native");
-								// A dropped PDF leaves only its label in the indexed chunk text,
-								// so its pages go into the prompt as extracted text instead.
 								if (pdfMode !== "native") {
-									systemPrompt += await buildRagPdfTextContext(plugin.app, localRag.mediaReferences);
+									ragContext += await buildRagPdfTextContext(plugin.app, localRag.mediaReferences);
 								}
 								if (ragAttachments.length > 0) {
 									const existing = userMessage.attachments || [];
@@ -3973,7 +3976,7 @@ Always be helpful and provide clear, concise responses. When working with notes,
 					}
 				}
 				if (vaultToolMode === "noSearch") {
-					systemPrompt += buildNoDiscoverySystemPrompt({
+					noDiscoveryContext = buildNoDiscoverySystemPrompt({
 						ragRequested: Boolean(ragSearchRunner),
 						hasRagContext: localRagSources.length > 0,
 					});
@@ -4023,8 +4026,19 @@ Always be helpful and provide clear, concise responses. When working with notes,
 				// Gemma 4 drops every tool when RAG or web search is on, so only describe
 				// rag_search when it actually survives into the request.
 				if (effectiveTools.some(tool => tool.name === RAG_SEARCH_TOOL_NAME)) {
-					systemPrompt += RAG_SEARCH_SYSTEM_PROMPT;
+					ragSearchContext = RAG_SEARCH_SYSTEM_PROMPT;
 				}
+
+				// Build system prompt using unified function
+				const systemPrompt = buildSystemPrompt(settings.systemPrompt, {
+					vaultToolMode,
+					pathContext,
+					okfContext,
+					ragContext,
+					skillsContext,
+					noDiscoveryContext,
+					ragSearchContext,
+				});
 
 				// Use image generation stream or regular chat stream
 				const chunkStream = isImageGeneration
