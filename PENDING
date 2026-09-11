@@ -65,10 +65,20 @@
 结班测 OCR 不在本插件。
 ```
 
+### 6. ~~提示词预设选择功能~~ ✅ 已完成
+- 新增 `PROMPT_PRESETS` 预设列表（XDF 雅思教学助手、通用 Obsidian 助手）
+- 设置页面添加下拉选择预设、TextArea 编辑、恢复默认按钮
+- 选择预设后 TextArea 只读，选择「自定义」后可编辑
+- 编辑时自动切换到「自定义」模式
+- `loadSettings` 迁移逻辑：旧用户自动检测 `selectedPreset`
+- 添加中英文 i18n 翻译
+
 ## 关键文件
-- `src/core/systemPrompt.ts` - ✅ 已创建
-- `src/types/index.ts` - ✅ 已修改
+- `src/core/systemPrompt.ts` - ✅ 已创建（含预设定义）
+- `src/types/index.ts` - ✅ 已修改（添加 `selectedPreset` 字段）
 - `src/ui/components/Chat.tsx` - ✅ API Provider 和 Gemini 路径已修改
+- `src/ui/settings/workspaceSettings.ts` - ✅ 已修改（预设选择 UI）
+- `src/plugin.ts` - ✅ 已修改（迁移逻辑）
 
 ## 参考
 - `references/QwenPaw/src/qwenpaw/runtime/protected_prompt.py` - QwenPaw 执行契约
