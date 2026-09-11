@@ -135,13 +135,11 @@ export const zh: Record<string, string> = {
   "settings.systemPrompt.desc": "AI 助手的指令。选择「自定义」后可编辑。",
   "settings.systemPrompt.readonly": "当前使用预设提示词。选择「自定义」后可编辑。",
   "settings.systemPrompt.placeholder": "用与问题相同的语言回答。",
+  "settings.systemPrompt.modalDesc": "编辑自定义提示词。修改后自动切换到「自定义」模式。",
+  "settings.systemPrompt.expandEdit": "展开编辑",
   "settings.promptPreset": "提示词预设",
   "settings.promptPreset.desc": "选择预设的提示词模板，或选择「自定义」手动编辑。",
   "settings.promptPreset.custom": "自定义",
-  "settings.resetPrompt": "恢复预设提示词",
-  "settings.resetPrompt.desc": "将提示词恢复为当前预设的默认内容",
-  "settings.resetPrompt.button": "恢复",
-  "settings.resetPrompt.notice": "已恢复预设提示词",
 
   // Settings - Tool limits
   "settings.maxToolCalls": "每次请求的最大工具调用次数",

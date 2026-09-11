@@ -6,6 +6,7 @@ import { getLocalRagStore } from "src/core/localRagStore";
 import { ragCredentialSecretId } from "src/core/credentialBundle";
 import { clearSecret, copySecret, readSecretJson } from "src/core/secretStorage";
 import { PROMPT_PRESETS, getPresetById } from "src/core/systemPrompt";
+import { SystemPromptModal } from "./SystemPromptModal";
 import type { SettingsContext } from "./settingsContext";
 
 export function displayWorkspaceSettings(containerEl: HTMLElement, ctx: SettingsContext): void {
@@ -178,8 +179,9 @@ export function displayWorkspaceSettings(containerEl: HTMLElement, ctx: Settings
       });
     });
 
-  // System Prompt - Preset selector
-  new Setting(containerEl)
+  // System Prompt - Merged preset selector + editor
+  const isCustom = plugin.settings.selectedPreset === "custom";
+  const systemPromptSetting = new Setting(containerEl)
     .setName(t("settings.promptPreset"))
     .setDesc(t("settings.promptPreset.desc"))
     .addDropdown((dropdown) => {
@@ -208,56 +210,44 @@ export function displayWorkspaceSettings(containerEl: HTMLElement, ctx: Settings
         });
     });
 
-  // System Prompt - TextArea (editable when "custom" is selected)
-  const isCustom = plugin.settings.selectedPreset === "custom";
-  const systemPromptSetting = new Setting(containerEl)
+  // Add expand edit button
+  systemPromptSetting.addButton((btn) =>
+    btn
+      .setButtonText(t("settings.systemPrompt.expandEdit"))
+      .onClick(() => {
+        new SystemPromptModal(
+          app,
+          plugin.settings.systemPrompt,
+          async (prompt) => {
+            plugin.settings.systemPrompt = prompt;
+            // Auto-switch to "custom" when user edits
+            if (plugin.settings.selectedPreset !== "custom") {
+              plugin.settings.selectedPreset = "custom";
+            }
+            await plugin.saveSettings();
+            display();
+          }
+        ).open();
+      })
+  );
+
+  // Show current prompt preview (read-only, small)
+  const previewSetting = new Setting(containerEl)
     .setName(t("settings.systemPrompt"))
     .setDesc(isCustom 
       ? t("settings.systemPrompt.desc")
       : t("settings.systemPrompt.readonly"));
 
-  systemPromptSetting.settingEl.addClass("llm-hub-settings-textarea-container");
+  previewSetting.settingEl.addClass("llm-hub-settings-textarea-container");
 
-  systemPromptSetting.addTextArea((text) => {
+  previewSetting.addTextArea((text) => {
     text
       .setPlaceholder(t("settings.systemPrompt.placeholder"))
       .setValue(plugin.settings.systemPrompt)
-      .setDisabled(!isCustom)
-      .onChange((value) => {
-        void (async () => {
-          plugin.settings.systemPrompt = value;
-          // Auto-switch to "custom" when user edits
-          if (plugin.settings.selectedPreset !== "custom") {
-            plugin.settings.selectedPreset = "custom";
-          }
-          await plugin.saveSettings();
-        })();
-      });
-    text.inputEl.rows = 6;
+      .setDisabled(true);
+    text.inputEl.rows = 4;
     text.inputEl.addClass("llm-hub-settings-textarea");
   });
-
-  // Reset to preset button
-  if (!isCustom) {
-    new Setting(containerEl)
-      .setName(t("settings.resetPrompt"))
-      .setDesc(t("settings.resetPrompt.desc"))
-      .addButton((btn) =>
-        btn
-          .setButtonText(t("settings.resetPrompt.button"))
-          .onClick(() => {
-            void (async () => {
-              const preset = getPresetById(plugin.settings.selectedPreset);
-              if (preset) {
-                plugin.settings.systemPrompt = preset.prompt;
-                await plugin.saveSettings();
-                new Notice(t("settings.resetPrompt.notice"));
-                display();
-              }
-            })();
-          })
-      );
-  }
 
   // Tool limits (collapsible)
   const detailsEl = containerEl.createEl("details", { cls: "llm-hub-settings-details" });

@@ -170,13 +170,11 @@ export const en = {
   "settings.systemPrompt.desc": "Instructions for the AI assistant. Editable when 'Custom' is selected.",
   "settings.systemPrompt.readonly": "Using preset prompt. Select 'Custom' to edit.",
   "settings.systemPrompt.placeholder": "Respond in the same language as the question.",
+  "settings.systemPrompt.modalDesc": "Edit custom prompt. Changes auto-switch to 'Custom' mode.",
+  "settings.systemPrompt.expandEdit": "Expand edit",
   "settings.promptPreset": "Prompt preset",
   "settings.promptPreset.desc": "Choose a preset prompt template, or select 'Custom' to edit manually.",
   "settings.promptPreset.custom": "Custom",
-  "settings.resetPrompt": "Reset to preset prompt",
-  "settings.resetPrompt.desc": "Restore the prompt to the current preset's default content",
-  "settings.resetPrompt.button": "Reset",
-  "settings.resetPrompt.notice": "Preset prompt restored",
 
   // Settings - Tool limits
   "settings.maxToolCalls": "Max tool calls per request",
