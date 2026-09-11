@@ -1,6 +1,6 @@
 {
   "name": "xdf-aichatbot",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "XDF teaching-archive agent shell forked from LLM Hub",
   "main": "main.js",
   "scripts": {
