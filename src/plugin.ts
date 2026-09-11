@@ -770,6 +770,21 @@ export class LlmHubPlugin extends Plugin {
         : [...DEFAULT_SETTINGS.mcpServers],
       xdfAutoBindToolkits: loaded.xdfAutoBindToolkits !== false,
       agentPlugins: Array.isArray(loaded.agentPlugins) ? loaded.agentPlugins : [],
+      // Migrate selectedPreset for existing users
+      selectedPreset: (() => {
+        // If already set, use it
+        if (loaded.selectedPreset) return loaded.selectedPreset;
+        // For existing users without selectedPreset, check if their systemPrompt matches a preset
+        if (loaded.systemPrompt) {
+          const defaultPreset = DEFAULT_SETTINGS.systemPrompt;
+          // If matches default (xdf-teaching preset), use that
+          if (loaded.systemPrompt === defaultPreset) return "xdf-teaching";
+          // Otherwise, mark as custom
+          return "custom";
+        }
+        // New user or empty prompt: use default preset
+        return DEFAULT_SETTINGS.selectedPreset;
+      })(),
       // Deep copy workflow arrays
       enabledWorkflowHotkeys: loaded.enabledWorkflowHotkeys
         ? [...loaded.enabledWorkflowHotkeys]

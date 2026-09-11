@@ -3,7 +3,7 @@
  * 
  * 参考 QwenPaw 的分层架构：
  * 1. 硬编码执行契约（PROTECTED_CONTRACT）- 不可被用户修改
- * 2. 用户自定义提示词（settings.systemPrompt）- XDF 教学助手规则
+ * 2. 用户选择的预设或自定义提示词（settings.systemPrompt）
  * 3. 运行时上下文（FILE_MENTION、OKF、RAG、Skills 等）
  */
 
@@ -39,6 +39,67 @@ export const PROTECTED_CONTRACT = `## 工具调用规则
 
 你只能通过工具完成操作。没有对应工具的事情，你无法做到。
 如果用户要求的功能没有对应工具，直接说明无法完成，不要假装可以做到。`;
+
+/**
+ * 提示词预设定义
+ */
+export interface PromptPreset {
+	id: string;
+	name: string;
+	description: string;
+	prompt: string;
+}
+
+/**
+ * 内置提示词预设列表
+ */
+export const PROMPT_PRESETS: PromptPreset[] = [
+	{
+		id: "xdf-teaching",
+		name: "XDF 雅思教学助手",
+		description: "新东方雅思教学档案场景，自动连接 xdf-toolkits 查询学员、班级、课次等数据",
+		prompt: `你是新东方雅思教学助手，当前库是固定结构的课程档案。
+
+## 数据来源限制
+
+班级名、学员名、课次号、日期、出勤、作业、分数只能来自 xdf-toolkits 工具返回的 JSON。
+工具没返回的数据视为不存在。
+
+不要用 search_notes 或聊天记录代替档案查询。
+
+## 写入规则
+
+写反馈、勾选、建档只用 MCP 的 write_* / create_*。
+不要破坏 <!-- AI_GENERATED_START/END --> 标记。
+
+结班测 OCR 不在本插件。`,
+	},
+	{
+		id: "general",
+		name: "通用 Obsidian 助手",
+		description: "通用的 Obsidian 笔记管理助手，适合日常笔记整理和知识管理",
+		prompt: `你是一个 Obsidian 笔记管理助手。
+
+## 工作原则
+
+- 帮助用户整理、搜索、管理笔记
+- 创建笔记时遵循良好的 Markdown 格式
+- 修改笔记前先读取现有内容
+- 使用 wikilink [[]] 建立笔记间的关联
+
+## 注意事项
+
+- 不要修改用户没有提到的笔记
+- 批量操作前确认用户意图`,
+	},
+];
+
+/**
+ * 根据预设 ID 获取预设
+ */
+export function getPresetById(id: string): PromptPreset | undefined {
+	return PROMPT_PRESETS.find(p => p.id === id);
+}
 
 /**
  * 运行时上下文参数
@@ -92,7 +153,7 @@ export function buildSystemPrompt(
 		parts.push(userPrompt.trim());
 	}
 
-	// 第 3 层：运行时上下文
+	// 第 4 层：运行时上下文
 	if (context.vaultToolMode !== "none") {
 		parts.push(FILE_MENTION_TOOL_PROMPT.trim());
 	}

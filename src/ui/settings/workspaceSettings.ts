@@ -5,6 +5,7 @@ import { ConfirmModal } from "src/ui/components/ConfirmModal";
 import { getLocalRagStore } from "src/core/localRagStore";
 import { ragCredentialSecretId } from "src/core/credentialBundle";
 import { clearSecret, copySecret, readSecretJson } from "src/core/secretStorage";
+import { PROMPT_PRESETS, getPresetById } from "src/core/systemPrompt";
 import type { SettingsContext } from "./settingsContext";
 
 export function displayWorkspaceSettings(containerEl: HTMLElement, ctx: SettingsContext): void {
@@ -177,10 +178,43 @@ export function displayWorkspaceSettings(containerEl: HTMLElement, ctx: Settings
       });
     });
 
-  // System Prompt
+  // System Prompt - Preset selector
+  new Setting(containerEl)
+    .setName(t("settings.promptPreset"))
+    .setDesc(t("settings.promptPreset.desc"))
+    .addDropdown((dropdown) => {
+      // Add built-in presets
+      for (const preset of PROMPT_PRESETS) {
+        dropdown.addOption(preset.id, preset.name);
+      }
+      // Add "custom" option
+      dropdown.addOption("custom", t("settings.promptPreset.custom"));
+      
+      dropdown
+        .setValue(plugin.settings.selectedPreset || "xdf-teaching")
+        .onChange((value) => {
+          void (async () => {
+            plugin.settings.selectedPreset = value;
+            // If a preset is selected, apply its prompt
+            if (value !== "custom") {
+              const preset = getPresetById(value);
+              if (preset) {
+                plugin.settings.systemPrompt = preset.prompt;
+              }
+            }
+            await plugin.saveSettings();
+            display();
+          })();
+        });
+    });
+
+  // System Prompt - TextArea (editable when "custom" is selected)
+  const isCustom = plugin.settings.selectedPreset === "custom";
   const systemPromptSetting = new Setting(containerEl)
     .setName(t("settings.systemPrompt"))
-    .setDesc(t("settings.systemPrompt.desc"));
+    .setDesc(isCustom 
+      ? t("settings.systemPrompt.desc")
+      : t("settings.systemPrompt.readonly"));
 
   systemPromptSetting.settingEl.addClass("llm-hub-settings-textarea-container");
 
@@ -188,15 +222,42 @@ export function displayWorkspaceSettings(containerEl: HTMLElement, ctx: Settings
     text
       .setPlaceholder(t("settings.systemPrompt.placeholder"))
       .setValue(plugin.settings.systemPrompt)
+      .setDisabled(!isCustom)
       .onChange((value) => {
         void (async () => {
           plugin.settings.systemPrompt = value;
+          // Auto-switch to "custom" when user edits
+          if (plugin.settings.selectedPreset !== "custom") {
+            plugin.settings.selectedPreset = "custom";
+          }
           await plugin.saveSettings();
         })();
       });
-    text.inputEl.rows = 4;
+    text.inputEl.rows = 6;
     text.inputEl.addClass("llm-hub-settings-textarea");
   });
+
+  // Reset to preset button
+  if (!isCustom) {
+    new Setting(containerEl)
+      .setName(t("settings.resetPrompt"))
+      .setDesc(t("settings.resetPrompt.desc"))
+      .addButton((btn) =>
+        btn
+          .setButtonText(t("settings.resetPrompt.button"))
+          .onClick(() => {
+            void (async () => {
+              const preset = getPresetById(plugin.settings.selectedPreset);
+              if (preset) {
+                plugin.settings.systemPrompt = preset.prompt;
+                await plugin.saveSettings();
+                new Notice(t("settings.resetPrompt.notice"));
+                display();
+              }
+            })();
+          })
+      );
+  }
 
   // Tool limits (collapsible)
   const detailsEl = containerEl.createEl("details", { cls: "llm-hub-settings-details" });

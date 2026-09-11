@@ -183,6 +183,7 @@ export interface LlmHubSettings {
   maxSavedChatHistories: number;
   manualChatSaveFolder: string;
   systemPrompt: string;
+  selectedPreset: string;  // "xdf-teaching" | "general" | "custom"
 
   // Slash commands
   slashCommands: SlashCommand[];
@@ -955,6 +956,7 @@ export const DEFAULT_SETTINGS: LlmHubSettings = {
   maxSavedChatHistories: 100,
   manualChatSaveFolder: "",
   systemPrompt: "你是新东方雅思教学助手，当前库是固定结构的课程档案。\n\n## 数据来源限制\n\n班级名、学员名、课次号、日期、出勤、作业、分数只能来自 xdf-toolkits 工具返回的 JSON。\n工具没返回的数据视为不存在。\n\n不要用 search_notes 或聊天记录代替档案查询。\n\n## 写入规则\n\n写反馈、勾选、建档只用 MCP 的 write_* / create_*。\n不要破坏 <!-- AI_GENERATED_START/END --> 标记。\n\n结班测 OCR 不在本插件。",
+  selectedPreset: "xdf-teaching",
   slashCommands: DEFAULT_SLASH_COMMANDS,
   knowledgeSources: [],
   enabledWorkflowHotkeys: [],

@@ -167,8 +167,16 @@ export const en = {
   "settings.deleteChatHistoryConfirm": "Do you want to delete all existing chat history files?",
   "settings.chatHistoryDeleted": "{{count}} chat history file(s) deleted",
   "settings.systemPrompt": "System prompt",
-  "settings.systemPrompt.desc": "Additional instructions for the AI assistant",
+  "settings.systemPrompt.desc": "Instructions for the AI assistant. Editable when 'Custom' is selected.",
+  "settings.systemPrompt.readonly": "Using preset prompt. Select 'Custom' to edit.",
   "settings.systemPrompt.placeholder": "Respond in the same language as the question.",
+  "settings.promptPreset": "Prompt preset",
+  "settings.promptPreset.desc": "Choose a preset prompt template, or select 'Custom' to edit manually.",
+  "settings.promptPreset.custom": "Custom",
+  "settings.resetPrompt": "Reset to preset prompt",
+  "settings.resetPrompt.desc": "Restore the prompt to the current preset's default content",
+  "settings.resetPrompt.button": "Reset",
+  "settings.resetPrompt.notice": "Preset prompt restored",
 
   // Settings - Tool limits
   "settings.maxToolCalls": "Max tool calls per request",
