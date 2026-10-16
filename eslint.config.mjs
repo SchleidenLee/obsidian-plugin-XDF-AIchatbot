@@ -51,7 +51,7 @@ const SENTENCE_CASE_IGNORES = [
 
 export default tseslint.config(
   {
-    ignores: ['main.js', 'node_modules/**', 'pdfjs/**', 'scripts/*.mjs', 'test/**', '*.js', '*.mjs', 'vitest.config.ts', 'src/**/*.test.ts'],
+    ignores: ['main.js', 'node_modules/**', 'pdfjs/**', 'references/**', 'scripts/*.mjs', 'test/**', '*.js', '*.mjs', 'vitest.config.ts', 'src/**/*.test.ts'],
   },
   ...tseslint.configs.recommendedTypeChecked,
   {
