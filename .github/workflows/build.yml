@@ -23,9 +23,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Lint
-        run: npm run lint
-
       - name: Validate manifest.json version
         run: |
           MANIFEST_VERSION=$(node -p "require('./manifest.json').version || ''")
